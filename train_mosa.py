@@ -5,6 +5,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR, ReduceLROnPlatea
 import numpy as np
 import os
 import time
+import datetime
 import json
 from tqdm import tqdm
 from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, classification_report
@@ -256,6 +257,10 @@ def test_model(model, test_loader, config, class_names=['CN', 'AD']):
     return test_acc, auc, cm, report
 
 def main():
+    # 记录训练开始时间
+    start_time = datetime.datetime.now()
+    print(f"训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     # 加载配置
     config = Config()
     config.backbone.pretrained = True
@@ -354,6 +359,12 @@ def main():
     print(f"\n最终测试结果:")
     print(f"测试准确率: {test_acc:.2f}%")
     print(f"AUC: {auc:.4f}")
+
+    # 训练结束时间
+    end_time = datetime.datetime.now()
+    print(f"训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    duration = end_time - start_time
+    print(f"训练总耗时: {str(duration)}")
 
 if __name__ == '__main__':
     main()

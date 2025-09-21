@@ -10,6 +10,7 @@ from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, recall_score
 from torch.utils.tensorboard import SummaryWriter  # 新增
 import matplotlib.pyplot as plt  # 新增
+import datetime  # 新增
 
 from config import Config
 from data_loader import get_data_loaders
@@ -291,6 +292,10 @@ def plot_full_learning_curves(
     plt.close()
 
 def main():
+    # 记录训练开始时间
+    start_time = datetime.datetime.now()
+    print(f"训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
     # 加载配置
     config = Config()
     config.backbone.pretrained = False  # 确保从头开始训练
@@ -394,6 +399,12 @@ def main():
     )
     # 绘制学习曲线
     plot_learning_curves(train_losses, val_losses, train_accs, val_accs, config.training.log_dir)
+    
+    # 训练结束时间
+    end_time = datetime.datetime.now()
+    print(f"训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    duration = end_time - start_time
+    print(f"训练总耗时: {str(duration)}")
     
     # 训练完成后，加载最佳模型并在测试集上评估
     print("\n训练完成，开始在测试集上评估最佳模型...")

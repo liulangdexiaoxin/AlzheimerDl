@@ -2,14 +2,23 @@ import os
 import numpy as np
 import nibabel as nib
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from scipy.ndimage import zoom
 from scipy import ndimage
 import logging
+from augment import augment  # 添加导入
+import torchio as tio
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+train_transform = tio.Compose([
+    tio.RandomFlip(axes=(0, 1, 2)),
+    tio.RandomAffine(scales=(0.9, 1.1), degrees=10),
+    tio.RandomNoise(mean=0, std=0.01),
+    tio.RandomBiasField(),
+])
 
 class MRIDataset(Dataset):
     def __init__(self, data_dir, classes=None, mode='train', target_size=128, transform=None):
@@ -114,15 +123,19 @@ class MRIDataset(Dataset):
         # 调整大小到目标尺寸
         data = self._resize_volume(data, self.target_size)
         
-        # 数据增强
-        if self.transform:
-            data = self.transform(data)
+        # 数据增强（仅训练集）
+        if self.mode == 'train':
+            data = augment(data)
         
         # 转换为PyTorch张量，保持3D格式 (H, W, D)
         data = torch.from_numpy(data).float()
         
         # 添加通道维度 (C, H, W, D)
         data = data.unsqueeze(0)
+        
+        if self.transform and self.mode == 'train':
+            data = self.transform(data[np.newaxis, ...])  # torchio expects (C, D, H, W)
+            data = data.squeeze(0)
         
         return data, label, img_path
 
@@ -165,11 +178,17 @@ def get_data_loaders(config):
     logger.info(f"Validation dataset size: {len(val_dataset)}")
     logger.info(f"Test dataset size: {len(test_dataset)}")
     
+    # 统计每个类别样本数，计算权重
+    class_counts = np.bincount(np.array(train_dataset.samples)[:, 1].astype(int))
+    weights = 1.0 / class_counts
+    sample_weights = weights[np.array(train_dataset.samples)[:, 1].astype(int)]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+    
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.data.batch_size,
-        shuffle=True,
+        sampler=sampler,
         num_workers=config.data.num_workers,
         pin_memory=True
     )
