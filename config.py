@@ -5,8 +5,8 @@ from typing import Optional
 
 @dataclass
 class DataConfig:
-    data_root: str = "/root/01_dataset/ADNI_dataset_compressed"
-    # data_root: str = "/root/01_dataset/AD_compressed/ADNI_dataset"
+    # data_root: str = "/root/01_dataset/ADNI_dataset_compressed"
+    data_root: str = "/root/01_dataset/AD_compressed/ADNI_dataset"
     batch_size: int = 24    # 根据独立显存大小设置，太大会导致每个epoch时间暴增，使用Tesla P40 24GB显存
     num_workers: int = 6    # 根据CPU核心数和IO能力设置（CPU 6核，12GB内存）
     target_size: int = 128
@@ -58,7 +58,7 @@ class TrainingConfig:
     patience: int = 5  # 用于plateau scheduler
     
     # 训练参数
-    num_epochs: int = 30   #预计耗时6小时
+    num_epochs: int = 5
     warmup_epochs: int = 5
     gradient_clip: float = 1.0
     

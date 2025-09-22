@@ -196,7 +196,7 @@ def get_data_loaders(config):
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.data.batch_size,
-        shuffle=False,
+        shuffle=False,  # 当shuffle=True时，DataLoader会在每个epoch开始前将数据顺序随机打乱，有助于提升模型的泛化能力，避免模型记住数据顺序，常用于训练集
         num_workers=config.data.num_workers,
         pin_memory=True
     )

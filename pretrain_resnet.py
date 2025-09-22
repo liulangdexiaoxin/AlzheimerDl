@@ -129,7 +129,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         })
     # 计算AUC
     auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc, batch_losses  # 新增返回 batch_losses
+    return losses.avg, top1.avg, recalls.avg, auc, batch_losses, all_targets, all_preds
 
 def validate(model, val_loader, criterion, config):
     """验证模型"""
@@ -163,7 +163,7 @@ def validate(model, val_loader, criterion, config):
                 'Recall': f'{recalls.avg:.2f}'
             })
     auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc
+    return losses.avg, top1.avg, recalls.avg, auc, all_targets, all_preds
 
 def test_model(model, test_loader, config, class_names=['CN', 'AD']):
     """测试模型性能"""
@@ -291,6 +291,37 @@ def plot_full_learning_curves(
     plt.savefig(os.path.join(save_dir, 'full_learning_curves.png'))
     plt.close()
 
+def plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, save_dir):
+    """
+        绘制准确率、F1 score、召回率曲线
+    """
+    epochs = range(1, len(train_accs) + 1)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs, train_accs, label='Train Accuracy')
+    plt.plot(epochs, val_accs, label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Accuracy Curve')
+    plt.legend()
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, train_f1s, label='Train F1')
+    plt.plot(epochs, val_f1s, label='Val F1')
+    plt.xlabel('Epoch')
+    plt.ylabel('Weighted F1-score')
+    plt.title('F1 Score Curve')
+    plt.legend()
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, train_recalls, label='Train Recall')
+    plt.plot(epochs, val_recalls, label='Val Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.title('Recall Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'metrics_curves.png'))
+    plt.close()
+
 def main():
     # 记录训练开始时间
     start_time = datetime.datetime.now()
@@ -299,7 +330,11 @@ def main():
     # 加载配置
     config = Config()
     config.backbone.pretrained = False  # 确保从头开始训练
-    
+
+    # 打印训练参数
+    print(f"Batch size: {config.data.batch_size}")
+    print(f"Epochs: {config.training.num_epochs}")
+
     # 设置随机种子
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -344,17 +379,55 @@ def main():
     # TensorBoard准备
     writer = SummaryWriter(log_dir=config.training.log_dir)  # 新增
     
-    # 训练循环
+    # 在训练循环前定义
+    train_batch_losses = []
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
-    train_batch_losses = []
+    train_f1s, val_f1s = [], []
+    train_recalls, val_recalls = [], []
+
+    # 训练循环
     for epoch in range(start_epoch, config.training.num_epochs):
         # 训练一个epoch
-        train_loss, train_acc, train_recall, train_auc, batch_losses = train_epoch(
+        train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds = train_epoch(
             model, train_loader, optimizer, criterion, scheduler, epoch, config
         )
-        val_loss, val_acc, val_recall, val_auc = validate(model, val_loader, criterion, config)
-        
+        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds = validate(model, val_loader, criterion, config)
+
+        train_report = classification_report(
+            train_targets, train_preds, target_names=['CN', 'AD'], output_dict=True
+        )
+        train_f1 = train_report['weighted avg']['f1-score']
+        val_report = classification_report(
+            val_targets, val_preds, target_names=['CN', 'AD'], output_dict=True
+        )
+        val_f1 = val_report['weighted avg']['f1-score']
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        train_f1s.append(train_f1)
+        val_f1s.append(val_f1)
+        train_recalls.append(train_recall)
+        val_recalls.append(val_recall)
+        train_batch_losses.extend(batch_losses)
+
+        # TensorBoard分组写入
+        writer.add_scalars('Train/Loss', {'Batch': np.mean(batch_losses), 'Epoch': train_loss}, epoch)
+        writer.add_scalars('Val/Loss', {'Epoch': val_loss}, epoch)
+        writer.add_scalars('Train/Accuracy', {'Epoch': train_acc}, epoch)
+        writer.add_scalars('Val/Accuracy', {'Epoch': val_acc}, epoch)
+        writer.add_scalars('Train/F1', {'Epoch': train_f1}, epoch)
+        writer.add_scalars('Val/F1', {'Epoch': val_f1}, epoch)
+        writer.add_scalars('Train/Recall', {'Epoch': train_recall}, epoch)
+        writer.add_scalars('Val/Recall', {'Epoch': val_recall}, epoch)
+
+        # 也可以继续写入AUC、学习率等
+        writer.add_scalar('Train/AUC', train_auc, epoch)
+        writer.add_scalar('Val/AUC', val_auc, epoch)
+        writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
             scheduler.step(val_acc)
@@ -374,24 +447,8 @@ def main():
                 'config': config.__dict__
             }, is_best, config.training.checkpoint_dir)
         
-        # TensorBoard写入
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('Loss/val', val_loss, epoch)
-        writer.add_scalar('Accuracy/train', train_acc, epoch)
-        writer.add_scalar('Accuracy/val', val_acc, epoch)
-        writer.add_scalar('Recall/train', train_recall, epoch)
-        writer.add_scalar('Recall/val', val_recall, epoch)
-        writer.add_scalar('AUC/train', train_auc, epoch)
-        writer.add_scalar('AUC/val', val_auc, epoch)
-        
         print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.2f}, Train AUC: {train_auc:.4f}, '
               f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.2f}, Val AUC: {val_auc:.4f}, Best Acc: {best_acc:.2f}%')
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
-        train_batch_losses.extend(batch_losses)  # 记录所有 batch loss
-
     writer.close()
     # 绘制详细学习曲线
     plot_full_learning_curves(
@@ -399,6 +456,8 @@ def main():
     )
     # 绘制学习曲线
     plot_learning_curves(train_losses, val_losses, train_accs, val_accs, config.training.log_dir)
+    # 绘制指标曲线
+    plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, config.training.log_dir)
     
     # 训练结束时间
     end_time = datetime.datetime.now()
