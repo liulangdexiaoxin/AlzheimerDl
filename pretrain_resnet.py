@@ -72,12 +72,12 @@ def create_scheduler(optimizer, config, train_loader):
 
 def create_loss_fn(config):
     """创建损失函数"""
-    # 强制使用focal loss
-    criterion = FocalLoss(
-        alpha=config.training.focal_alpha,
-        gamma=config.training.focal_gamma
-    )
-    return criterion
+    if config.training.loss_fn == "cross_entropy":
+        return nn.CrossEntropyLoss(label_smoothing=config.training.label_smoothing)
+    elif config.training.loss_fn == "focal":
+        return FocalLoss(alpha=config.training.focal_alpha, gamma=config.training.focal_gamma)
+    else:
+        raise ValueError(f"Unsupported loss function: {config.training.loss_fn}")
 
 def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, config):
     """训练一个epoch"""
