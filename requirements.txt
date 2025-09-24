@@ -1,0 +1,10 @@
+einops==0.8.1
+matplotlib==3.10.6
+nibabel==5.3.2
+numpy==2.3.3
+scikit_learn==1.7.2
+scipy==1.16.2
+seaborn==0.13.2
+torch==2.5.0+cu124
+torchio==0.20.22
+tqdm==4.66.5
