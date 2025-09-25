@@ -120,7 +120,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
             'Recall': f'{recalls.avg:.2f}'
         })
     auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc, batch_losses
+    return losses.avg, top1.avg, recalls.avg, auc, batch_losses, all_targets, all_preds
 
 def validate(model, val_loader, criterion, config):
     """验证模型"""
@@ -150,7 +150,7 @@ def validate(model, val_loader, criterion, config):
                 'Recall': f'{recalls.avg:.2f}'
             })
     auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc
+    return losses.avg, top1.avg, recalls.avg, auc, all_targets, all_preds
 
 def plot_learning_curves(train_losses, val_losses, train_accs, val_accs, save_dir):
     """绘制并保存学习曲线"""
@@ -303,24 +303,21 @@ def main():
     train_recalls, val_recalls = [], []
     train_aucs, val_aucs = [], []
     train_batch_losses = []
+    train_f1s, val_f1s = [], []
+
     for epoch in range(start_epoch, config.training.num_epochs):
         # 训练一个epoch
-        train_loss, train_acc, train_recall, train_auc, batch_losses = train_epoch(
+        train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds = train_epoch(
             model, train_loader, optimizer, criterion, scheduler, epoch, config
         )
-        
         # 验证
-        val_loss, val_acc, val_recall, val_auc = validate(model, val_loader, criterion, config)
-        
+        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds = validate(model, val_loader, criterion, config)
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
             scheduler.step(val_acc)
-        
         # 保存最佳模型
         is_best = val_acc > best_acc
         best_acc = max(val_acc, best_acc)
-        
-        # 保存检查点
         if (epoch + 1) % config.training.save_freq == 0 or is_best:
             save_checkpoint({
                 'epoch': epoch + 1,
@@ -330,10 +327,8 @@ def main():
                 'scheduler': scheduler.state_dict() if scheduler else None,
                 'config': config.__dict__
             }, is_best, config.training.checkpoint_dir)
-        
         print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.2f}, Train AUC: {train_auc:.4f}, '
               f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.2f}, Val AUC: {val_auc:.4f}, Best Acc: {best_acc:.2f}%')
-        
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         train_accs.append(train_acc)
@@ -343,11 +338,19 @@ def main():
         train_aucs.append(train_auc)
         val_aucs.append(val_auc)
         train_batch_losses.extend(batch_losses)
-    
+        # 统计F1-score
+        train_report = classification_report(train_targets, train_preds, target_names=['CN', 'AD'], output_dict=True)
+        val_report = classification_report(val_targets, val_preds, target_names=['CN', 'AD'], output_dict=True)
+        train_f1s.append(train_report['weighted avg']['f1-score'])
+        val_f1s.append(val_report['weighted avg']['f1-score'])
+
     plot_full_learning_curves(
         train_batch_losses, train_losses, val_losses, val_accs, config.training.log_dir
     )
     plot_learning_curves(train_losses, val_losses, train_accs, val_accs, config.training.log_dir)
+    # 新增：绘制F1-score和Recall曲线
+    from utils import plot_metrics_curves
+    plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, config.training.log_dir)
     print("\n训练完成，开始在测试集上评估最佳模型...")
     best_model_path = os.path.join(config.training.checkpoint_dir, 'model_best.pth.tar')
     if os.path.exists(best_model_path):
@@ -359,8 +362,6 @@ def main():
     print(f"\n最终测试结果:")
     print(f"测试准确率: {test_acc:.2f}%")
     print(f"AUC: {auc:.4f}")
-
-    # 训练结束时间
     end_time = datetime.datetime.now()
     print(f"训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     duration = end_time - start_time
