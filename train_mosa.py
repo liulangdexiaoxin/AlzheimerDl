@@ -209,6 +209,37 @@ def plot_full_learning_curves(
     plt.savefig(os.path.join(save_dir, 'full_learning_curves.png'))
     plt.close()
 
+def plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, save_dir):
+    """
+        绘制准确率、F1 score、召回率曲线
+    """
+    epochs = range(1, len(train_accs) + 1)
+    plt.figure(figsize=(15, 5))
+    plt.subplot(1, 3, 1)
+    plt.plot(epochs, train_accs, label='Train Accuracy')
+    plt.plot(epochs, val_accs, label='Val Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Accuracy Curve')
+    plt.legend()
+    plt.subplot(1, 3, 2)
+    plt.plot(epochs, train_f1s, label='Train F1')
+    plt.plot(epochs, val_f1s, label='Val F1')
+    plt.xlabel('Epoch')
+    plt.ylabel('Weighted F1-score')
+    plt.title('F1 Score Curve')
+    plt.legend()
+    plt.subplot(1, 3, 3)
+    plt.plot(epochs, train_recalls, label='Train Recall')
+    plt.plot(epochs, val_recalls, label='Val Recall')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.title('Recall Curve')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'metrics_curves.png'))
+    plt.close()
+
 def test_model(model, test_loader, config, class_names=['CN', 'AD']):
     """测试模型性能"""
     model.eval()
@@ -306,6 +337,9 @@ def main():
     train_batch_losses = []
     train_f1s, val_f1s = [], []
 
+    print(f"Batch size: {config.training.batch_size}")
+    print(f"Total epochs: {config.training.num_epochs}")
+
     for epoch in range(start_epoch, config.training.num_epochs):
         # 训练一个epoch
         train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds = train_epoch(
@@ -345,12 +379,13 @@ def main():
         train_f1s.append(train_report['weighted avg']['f1-score'])
         val_f1s.append(val_report['weighted avg']['f1-score'])
 
+    # 绘制详细学习曲线
     plot_full_learning_curves(
         train_batch_losses, train_losses, val_losses, val_accs, config.training.log_dir
     )
+    # 绘制学习曲线
     plot_learning_curves(train_losses, val_losses, train_accs, val_accs, config.training.log_dir)
-    # 新增：绘制F1-score和Recall曲线
-    from utils import plot_metrics_curves
+    # 绘制指标曲线
     plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, config.training.log_dir)
     print("\n训练完成，开始在测试集上评估最佳模型...")
     best_model_path = os.path.join(config.training.checkpoint_dir, 'model_best.pth.tar')
