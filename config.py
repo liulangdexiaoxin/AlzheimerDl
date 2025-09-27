@@ -7,8 +7,8 @@ from typing import Optional
 class DataConfig:
     data_root: str = "/root/01_dataset/ADNI_dataset_compressed"
     # data_root: str = "/root/01_dataset/AD_compressed/ADNI_dataset"
-    batch_size: int = 24    # 根据独立显存大小设置，太大会导致每个epoch时间暴增，使用Tesla P40 24GB显存
-    num_workers: int = 6    # 根据CPU核心数和IO能力设置（CPU 6核，12GB内存）
+    batch_size: int = 32    # 根据独立显存大小设置，太大会导致每个epoch时间暴增，使用Tesla P40 24GB显存设置24，使用A100 80GB显存设置32
+    num_workers: int = 16    # 根据CPU核心数和IO能力设置（CPU 6核，12GB内存）
     target_size: int = 128
     # train_split: float = 0.7
     # val_split: float = 0.15

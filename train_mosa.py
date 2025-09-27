@@ -263,8 +263,9 @@ def main():
     
     # 加载配置
     config = Config()
-    config.backbone.pretrained = True
-    config.backbone.pretrained_path = os.path.join(config.training.checkpoint_dir, 'model_best.pth.tar')
+    # 配置文件配置BackboneConfig
+    # config.backbone.pretrained = True
+    # config.backbone.pretrained_path = os.path.join(config.training.checkpoint_dir, 'model_best.pth.tar')
     
     # 设置随机种子
     torch.manual_seed(config.seed)
