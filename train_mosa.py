@@ -13,6 +13,7 @@ import json
 from tqdm import tqdm
 from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, classification_report
 import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 from config import Config
 from data_loader import get_data_loaders
@@ -86,7 +87,7 @@ def create_loss_fn(config):
     
     return criterion
 
-def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, config):
+def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, config, writer=None):
     """训练一个epoch"""
     model.train()
     losses = AverageMeter()
@@ -117,15 +118,28 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         recalls.update(recall, data.size(0))
         all_targets.extend(target.cpu().numpy())
         all_preds.extend(preds.cpu().numpy())
-        pbar.set_postfix({
-            'Loss': f'{losses.avg:.4f}',
-            'Acc': f'{top1.avg:.2f}%',
-            'Recall': f'{recalls.avg:.2f}'
-        })
+        # F1-score
+        f1 = recall_score(target.cpu().numpy(), preds.cpu().numpy(), average='macro', zero_division=0)
+        # TensorBoard记录每batch
+        if writer is not None:
+            global_step = epoch * len(train_loader) + batch_idx
+            writer.add_scalar('Train/Loss_batch', loss.item(), global_step)
+            writer.add_scalar('Train/Accuracy_batch', acc1.item(), global_step)
+            writer.add_scalar('Train/Recall_batch', recall, global_step)
+            writer.add_scalar('Train/F1_batch', f1, global_step)
     auc = roc_auc_score(all_targets, all_preds)
+    # F1-score每epoch
+    from sklearn.metrics import f1_score
+    f1_epoch = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+    if writer is not None:
+        writer.add_scalar('Train/Loss_epoch', losses.avg, epoch)
+        writer.add_scalar('Train/Accuracy_epoch', top1.avg, epoch)
+        writer.add_scalar('Train/Recall_epoch', recalls.avg, epoch)
+        writer.add_scalar('Train/AUC_epoch', auc, epoch)
+        writer.add_scalar('Train/F1_epoch', f1_epoch, epoch)
     return losses.avg, top1.avg, recalls.avg, auc, batch_losses, all_targets, all_preds
 
-def validate(model, val_loader, criterion, config):
+def validate(model, val_loader, criterion, config, epoch=None, writer=None):
     """验证模型"""
     model.eval()
     losses = AverageMeter()
@@ -135,7 +149,7 @@ def validate(model, val_loader, criterion, config):
     all_preds = []
     with torch.no_grad():
         pbar = tqdm(val_loader, desc='Validation')
-        for data, target, _ in pbar:
+        for batch_idx, (data, target, _) in enumerate(pbar):
             data, target = data.to(config.device), target.to(config.device)
             output = model(data)
             loss = criterion(output, target)
@@ -147,12 +161,24 @@ def validate(model, val_loader, criterion, config):
             recalls.update(recall, data.size(0))
             all_targets.extend(target.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
-            pbar.set_postfix({
-                'Loss': f'{losses.avg:.4f}',
-                'Acc': f'{top1.avg:.2f}%',
-                'Recall': f'{recalls.avg:.2f}'
-            })
+            # F1-score
+            f1 = recall_score(target.cpu().numpy(), preds.cpu().numpy(), average='macro', zero_division=0)
+            # TensorBoard记录每batch
+            if writer is not None and epoch is not None:
+                global_step = epoch * len(val_loader) + batch_idx
+                writer.add_scalar('Val/Loss_batch', loss.item(), global_step)
+                writer.add_scalar('Val/Accuracy_batch', acc1.item(), global_step)
+                writer.add_scalar('Val/Recall_batch', recall, global_step)
+                writer.add_scalar('Val/F1_batch', f1, global_step)
     auc = roc_auc_score(all_targets, all_preds)
+    from sklearn.metrics import f1_score
+    f1_epoch = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
+    if writer is not None and epoch is not None:
+        writer.add_scalar('Val/Loss_epoch', losses.avg, epoch)
+        writer.add_scalar('Val/Accuracy_epoch', top1.avg, epoch)
+        writer.add_scalar('Val/Recall_epoch', recalls.avg, epoch)
+        writer.add_scalar('Val/AUC_epoch', auc, epoch)
+        writer.add_scalar('Val/F1_epoch', f1_epoch, epoch)
     return losses.avg, top1.avg, recalls.avg, auc, all_targets, all_preds
 
 def plot_learning_curves(train_losses, val_losses, train_accs, val_accs, save_dir):
@@ -332,6 +358,9 @@ def main():
         )
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
+    # TensorBoard记录
+    writer = SummaryWriter(config.training.log_dir)
+    
     # 训练循环
     train_losses, val_losses = [], []
     train_accs, val_accs = [], []
@@ -340,16 +369,55 @@ def main():
     train_batch_losses = []
     train_f1s, val_f1s = [], []
 
-    print(f"Batch size: {config.training.batch_size}")
+    print(f"Batch size: {config.data.batch_size}")
     print(f"Total epochs: {config.training.num_epochs}")
 
     for epoch in range(start_epoch, config.training.num_epochs):
         # 训练一个epoch
         train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds = train_epoch(
-            model, train_loader, optimizer, criterion, scheduler, epoch, config
+            model, train_loader, optimizer, criterion, scheduler, epoch, config, writer
         )
         # 验证
-        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds = validate(model, val_loader, criterion, config)
+        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds = validate(
+            model, val_loader, criterion, config, epoch, writer
+        )
+
+        train_report = classification_report(
+            train_targets, train_preds, target_names=['CN', 'AD'], output_dict=True
+        )
+        train_f1 = train_report['weighted avg']['f1-score']
+        val_report = classification_report(
+            val_targets, val_preds, target_names=['CN', 'AD'], output_dict=True
+        )
+        val_f1 = val_report['weighted avg']['f1-score']
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        train_f1s.append(train_f1)
+        val_f1s.append(val_f1)
+        train_recalls.append(train_recall)
+        val_recalls.append(val_recall)
+        train_batch_losses.extend(batch_losses)
+
+        # 分开写入TensorBoard（每epoch）
+        writer.add_scalar('Train/Loss_epoch', train_loss, epoch)
+        writer.add_scalar('Val/Loss_epoch', val_loss, epoch)
+        writer.add_scalar('Train/Accuracy_epoch', train_acc, epoch)
+        writer.add_scalar('Val/Accuracy_epoch', val_acc, epoch)
+        writer.add_scalar('Train/F1_epoch', train_f1, epoch)
+        writer.add_scalar('Val/F1_epoch', val_f1, epoch)
+        writer.add_scalar('Train/Recall_epoch', train_recall, epoch)
+        writer.add_scalar('Val/Recall_epoch', val_recall, epoch)
+        writer.add_scalar('Train/AUC_epoch', train_auc, epoch)
+        writer.add_scalar('Val/AUC_epoch', val_auc, epoch)
+        writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+
+        # 分开写入TensorBoard（每batch，只记录train，val已在validate里写入）
+        for batch_idx, batch_loss in enumerate(batch_losses):
+            global_step = epoch * len(train_loader) + batch_idx
+            writer.add_scalar('Train/Loss_batch', batch_loss, global_step)
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
             scheduler.step(val_acc)
@@ -365,8 +433,9 @@ def main():
                 'scheduler': scheduler.state_dict() if scheduler else None,
                 'config': config.__dict__
             }, is_best, config.training.checkpoint_dir)
-        print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.2f}, Train AUC: {train_auc:.4f}, '
-              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.2f}, Val AUC: {val_auc:.4f}, Best Acc: {best_acc:.2f}%')
+        print(f'Epoch {epoch+1}: '
+              f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.4f} | '
+              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.4f}')
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         train_accs.append(train_acc)
@@ -405,6 +474,7 @@ def main():
     print(f"训练结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     duration = end_time - start_time
     print(f"训练总耗时: {str(duration)}")
+    writer.close()
 
 if __name__ == '__main__':
     main()
