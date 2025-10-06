@@ -54,7 +54,7 @@ class TrainingConfig:
     lr_scheduler: str = "cosine"  # "cosine", "step", "plateau"
     step_size: int = 10  # 用于step scheduler
     gamma: float = 0.1  # 用于step scheduler
-    min_lr: float = 1e-6  # 用于cosine/plateau scheduler
+    min_lr: float = 1e-7  # 用于cosine/plateau scheduler
     patience: int = 5  # 用于plateau scheduler
     
     # 训练参数
