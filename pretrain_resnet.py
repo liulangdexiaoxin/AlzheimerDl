@@ -1,3 +1,9 @@
+"""Pretrain ResNet training script
+
+Notes on F1 logging:
+    - Batch-level F1 (Train/F1_batch, Val/F1_batch) uses macro average for stability on small batches.
+    - Epoch/Test-level F1 (Train/F1, Val/F1, Test/F1) uses weighted average to reflect class imbalance.
+"""
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,15 +13,35 @@ import os
 import time
 import json
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, recall_score
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, recall_score, roc_curve, auc as calc_auc, precision_score
+from metrics_utils import (
+    compute_auc, compute_precision, compute_specificity, compute_f1,
+    compute_recall, compute_confusion_matrix, plot_confusion_matrix_figure,
+    plot_roc_figure, compute_per_class_metrics, plot_per_class_bars,
+    compute_macro_weighted_summary, plot_class_support_bar
+)
 from torch.utils.tensorboard import SummaryWriter  # 新增
+from datetime import datetime
 import matplotlib.pyplot as plt  # 新增
 import datetime  # 新增
+
+# 常量，统一标签与键
+ACC_LABEL = 'Accuracy (%)'
+WEIGHTED_AVG_KEY = 'weighted avg'
 
 from config import Config
 from data_loader import get_data_loaders
 from model_builder import build_backbone, count_parameters
 from utils import AverageMeter, accuracy, save_checkpoint, load_checkpoint, FocalLoss, plot_confusion_matrix  # 添加导入
+
+def log_epoch_metrics(writer, epoch: int, prefix: str, metrics: dict):
+    """统一写入一个阶段的 epoch 级指标
+    metrics: key->value (scalars)
+    """
+    if writer is None:
+        return
+    for k, v in metrics.items():
+        writer.add_scalar(f'{prefix}/{k}', v, epoch)
 
 def create_optimizer(model, config):
     """创建优化器"""
@@ -79,7 +105,7 @@ def create_loss_fn(config):
     else:
         raise ValueError(f"Unsupported loss function: {config.training.loss_fn}")
 
-def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, config):
+def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, config, writer=None):
     """训练一个epoch"""
     model.train()
     losses = AverageMeter()
@@ -87,6 +113,8 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
     recalls = AverageMeter()
     all_targets = []
     all_preds = []
+    all_probs = []
+    grad_norm_accumulate = []
     batch_losses = []  # 新增
 
     pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config.training.num_epochs} [Train]')
@@ -101,11 +129,19 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         # 反向传播
         optimizer.zero_grad()
         loss.backward()
-        
         # 梯度裁剪
         if config.training.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.training.gradient_clip)
-        
+        # 计算梯度范数
+        if writer is not None:
+            total_norm_sq = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm_sq += param_norm.item() ** 2
+            grad_norm = total_norm_sq ** 0.5
+        else:
+            grad_norm = None
         optimizer.step()
         
         # 更新学习率
@@ -117,21 +153,40 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         losses.update(loss.item(), data.size(0))
         top1.update(acc1.item(), data.size(0))
         # 记录召回率
-        preds = torch.argmax(output, dim=1)
-        recall = recall_score(target.cpu().numpy(), preds.cpu().numpy(), average='macro', zero_division=0)
+        probs = torch.softmax(output, dim=1)
+        preds = torch.argmax(probs, dim=1)
+        recall = compute_recall(target.cpu().numpy(), preds.cpu().numpy())
         recalls.update(recall, data.size(0))
         all_targets.extend(target.cpu().numpy())
         all_preds.extend(preds.cpu().numpy())
-        pbar.set_postfix({
-            'Loss': f'{losses.avg:.4f}',
-            'Acc': f'{top1.avg:.2f}%',
-            'Recall': f'{recalls.avg:.2f}'
-        })
-    # 计算AUC
-    auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc, batch_losses, all_targets, all_preds
+        all_probs.extend(probs.detach().cpu().numpy())
+        # TensorBoard batch logging
+        if writer is not None:
+            global_step = epoch * len(train_loader) + batch_idx
+            writer.add_scalar('Train/Loss_batch', loss.item(), global_step)
+            writer.add_scalar('Train/Accuracy_batch', acc1.item(), global_step)
+            writer.add_scalar('Train/Recall_batch', recall, global_step)
+            f1_batch = compute_f1(target.cpu().numpy(), preds.cpu().numpy(), average='macro')
+            writer.add_scalar('Train/F1_batch', f1_batch, global_step)
+            if grad_norm is not None:
+                writer.add_scalar('Train/GradNorm_batch', grad_norm, global_step)
+        if grad_norm is not None:
+            grad_norm_accumulate.append(grad_norm)
+        pbar.set_postfix({'Loss': f'{losses.avg:.4f}', 'Acc': f'{top1.avg:.2f}%', 'Recall': f'{recalls.avg:.2f}'})
+    # 计算AUC 使用概率
+    auc_val = compute_auc(all_targets, all_probs)
+    grad_norm_epoch_mean = float(np.mean(grad_norm_accumulate)) if grad_norm_accumulate else 0.0
+    if writer is not None:
+        writer.add_scalar('Train/GradNorm_epoch_mean', grad_norm_epoch_mean, epoch)
+    # Precision & Specificity (epoch)
+    train_precision = compute_precision(all_targets, all_preds)
+    train_specificity = compute_specificity(all_targets, all_preds)
+    if writer is not None:
+        writer.add_scalar('Train/Precision', train_precision, epoch)
+        writer.add_scalar('Train/Specificity', train_specificity, epoch)
+    return losses.avg, top1.avg, recalls.avg, auc_val, batch_losses, all_targets, all_preds, all_probs
 
-def validate(model, val_loader, criterion, config):
+def validate(model, val_loader, criterion, config, epoch=None, writer=None):
     """验证模型"""
     model.eval()
     losses = AverageMeter()
@@ -139,9 +194,10 @@ def validate(model, val_loader, criterion, config):
     recalls = AverageMeter()
     all_targets = []
     all_preds = []
+    all_probs = []
     with torch.no_grad():
         pbar = tqdm(val_loader, desc='Validation')
-        for data, target, _ in pbar:
+        for batch_idx, (data, target, _) in enumerate(pbar):
             data, target = data.to(config.device), target.to(config.device)
             
             # 前向传播
@@ -152,20 +208,32 @@ def validate(model, val_loader, criterion, config):
             acc1 = accuracy(output, target, topk=(1,))[0]
             losses.update(loss.item(), data.size(0))
             top1.update(acc1.item(), data.size(0))
-            preds = torch.argmax(output, dim=1)
-            recall = recall_score(target.cpu().numpy(), preds.cpu().numpy(), average='macro', zero_division=0)
+            probs = torch.softmax(output, dim=1)
+            preds = torch.argmax(probs, dim=1)
+            recall = compute_recall(target.cpu().numpy(), preds.cpu().numpy())
             recalls.update(recall, data.size(0))
             all_targets.extend(target.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
-            pbar.set_postfix({
-                'Loss': f'{losses.avg:.4f}',
-                'Acc': f'{top1.avg:.2f}%',
-                'Recall': f'{recalls.avg:.2f}'
-            })
-    auc = roc_auc_score(all_targets, all_preds)
-    return losses.avg, top1.avg, recalls.avg, auc, all_targets, all_preds
+            all_probs.extend(probs.cpu().numpy())
+            if writer is not None and epoch is not None:
+                global_step = epoch * len(val_loader) + batch_idx
+                writer.add_scalar('Val/Loss_batch', loss.item(), global_step)
+                writer.add_scalar('Val/Accuracy_batch', acc1.item(), global_step)
+                writer.add_scalar('Val/Recall_batch', recall, global_step)
+                # F1 batch (macro)
+                f1_b = compute_f1(target.cpu().numpy(), preds.cpu().numpy(), average='macro')
+                writer.add_scalar('Val/F1_batch', f1_b, global_step)
+            pbar.set_postfix({'Loss': f'{losses.avg:.4f}', 'Acc': f'{top1.avg:.2f}%', 'Recall': f'{recalls.avg:.2f}'})
+    auc_val = compute_auc(all_targets, all_probs)
+    # Precision & Specificity (validation)
+    val_precision = compute_precision(all_targets, all_preds)
+    val_specificity = compute_specificity(all_targets, all_preds)
+    if writer is not None and epoch is not None:
+        writer.add_scalar('Val/Precision', val_precision, epoch)
+        writer.add_scalar('Val/Specificity', val_specificity, epoch)
+    return losses.avg, top1.avg, recalls.avg, auc_val, all_targets, all_preds, all_probs
 
-def test_model(model, test_loader, config, class_names=['CN', 'AD']):
+def test_model(model, test_loader, config, class_names=['CN', 'AD'], save_dir=None):
     """测试模型性能"""
     model.eval()
     all_preds = []
@@ -183,20 +251,18 @@ def test_model(model, test_loader, config, class_names=['CN', 'AD']):
             all_targets.extend(target.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
     
-    cm = confusion_matrix(all_targets, all_preds)
+    cm = compute_confusion_matrix(all_targets, all_preds)
     report = classification_report(all_targets, all_preds, target_names=class_names, output_dict=True)
-    if len(class_names) == 2:
-        auc = roc_auc_score(all_targets, [p[1] for p in all_probs])
-    else:
-        auc = roc_auc_score(all_targets, all_probs, multi_class='ovr')
+    auc = compute_auc(all_targets, all_probs)
     test_acc = np.mean(np.array(all_preds) == np.array(all_targets)) * 100
 
     # 绘制混淆矩阵
+    out_dir = save_dir or config.training.log_dir
     plot_confusion_matrix(cm, class_names, 
-        save_path=os.path.join(config.training.log_dir, 'confusion_matrix.png'))
+        save_path=os.path.join(out_dir, 'confusion_matrix.png'))
 
     # 打印 weighted f1-score
-    weighted_f1 = report['weighted avg']['f1-score']
+    weighted_f1 = compute_f1(all_targets, all_preds)
     print(f"\nWeighted F1-score: {weighted_f1:.4f}")
 
     # 打印结果
@@ -220,10 +286,27 @@ def test_model(model, test_loader, config, class_names=['CN', 'AD']):
         'confusion_matrix': cm.tolist()
     }
     
-    with open(os.path.join(config.training.log_dir, 'test_results.json'), 'w') as f:
+    with open(os.path.join(out_dir, 'test_results.json'), 'w') as f:
         json.dump(results, f, indent=4)
     
-    return test_acc, auc, cm, report
+    # Precision & Specificity (test)
+    try:
+        test_precision = precision_score(all_targets, all_preds, average='weighted', zero_division=0)
+    except Exception:
+        test_precision = 0.0
+    try:
+        specs = []
+        for i in range(cm.shape[0]):
+            TP = cm[i, i]
+            FP = cm[:, i].sum() - TP
+            FN = cm[i, :].sum() - TP
+            TN = cm.sum() - TP - FP - FN
+            spec = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+            specs.append(spec)
+        test_specificity = float(np.mean(specs)) if specs else 0.0
+    except Exception:
+        test_specificity = 0.0
+    return test_acc, auc, cm, report, all_probs, test_precision, test_specificity, all_targets
 
 def plot_learning_curves(train_losses, val_losses, train_accs, val_accs, save_dir):
     """绘制并保存学习曲线"""
@@ -376,8 +459,16 @@ def main():
         )
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
-    # TensorBoard准备
-    writer = SummaryWriter(log_dir=config.training.log_dir)  # 新增
+    # TensorBoard 准备: 为每次运行创建独立子目录
+    run_name = f"pretrain_resnet_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    log_dir = os.path.join(config.training.log_dir, run_name)
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    # 记录配置
+    try:
+        writer.add_text('Config', json.dumps(dict(config.__dict__.items()), indent=2))
+    except Exception:
+        pass
     
     # 在训练循环前定义
     train_batch_losses = []
@@ -385,23 +476,18 @@ def main():
     train_accs, val_accs = [], []
     train_f1s, val_f1s = [], []
     train_recalls, val_recalls = [], []
+    best_state = {'epoch': -1, 'val_acc': 0, 'val_auc': 0, 'val_f1': 0, 'val_recall': 0}
 
     # 训练循环
     for epoch in range(start_epoch, config.training.num_epochs):
         # 训练一个epoch
-        train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds = train_epoch(
-            model, train_loader, optimizer, criterion, scheduler, epoch, config
+        train_loss, train_acc, train_recall, train_auc, batch_losses, train_targets, train_preds, _ = train_epoch(
+            model, train_loader, optimizer, criterion, scheduler, epoch, config, writer
         )
-        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds = validate(model, val_loader, criterion, config)
+        val_loss, val_acc, val_recall, val_auc, val_targets, val_preds, val_probs = validate(model, val_loader, criterion, config, epoch, writer)
 
-        train_report = classification_report(
-            train_targets, train_preds, target_names=['CN', 'AD'], output_dict=True
-        )
-        train_f1 = train_report['weighted avg']['f1-score']
-        val_report = classification_report(
-            val_targets, val_preds, target_names=['CN', 'AD'], output_dict=True
-        )
-        val_f1 = val_report['weighted avg']['f1-score']
+        train_f1 = compute_f1(train_targets, train_preds, average='weighted')
+        val_f1 = compute_f1(val_targets, val_preds, average='weighted')
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -413,28 +499,105 @@ def main():
         val_recalls.append(val_recall)
         train_batch_losses.extend(batch_losses)
 
-        # TensorBoard分组写入
-        writer.add_scalars('Train/Loss', {'Batch': np.mean(batch_losses), 'Epoch': train_loss}, epoch)
-        writer.add_scalars('Val/Loss', {'Epoch': val_loss}, epoch)
-        writer.add_scalars('Train/Accuracy', {'Epoch': train_acc}, epoch)
-        writer.add_scalars('Val/Accuracy', {'Epoch': val_acc}, epoch)
-        writer.add_scalars('Train/F1', {'Epoch': train_f1}, epoch)
-        writer.add_scalars('Val/F1', {'Epoch': val_f1}, epoch)
-        writer.add_scalars('Train/Recall', {'Epoch': train_recall}, epoch)
-        writer.add_scalars('Val/Recall', {'Epoch': val_recall}, epoch)
-
-        # 也可以继续写入AUC、学习率等
-        writer.add_scalar('Train/AUC', train_auc, epoch)
-        writer.add_scalar('Val/AUC', val_auc, epoch)
+        # TensorBoard 每 epoch 写入（统一命名）
+        log_epoch_metrics(writer, epoch, 'Train', {
+            'Loss': train_loss,
+            'Accuracy': train_acc,
+            'F1': train_f1,
+            'Recall': train_recall,
+            'AUC': train_auc,
+        })
+        log_epoch_metrics(writer, epoch, 'Val', {
+            'Loss': val_loss,
+            'Accuracy': val_acc,
+            'F1': val_f1,
+            'Recall': val_recall,
+            'AUC': val_auc,
+        })
         writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+        # 记录 epoch 平均梯度范数（可选：用最后一次 grad_norm 代表）
+        # if 'grad_norm' in locals() and grad_norm is not None:
+        #     writer.add_scalar('Train/GradNorm_epoch_last', grad_norm, epoch)
+        if (epoch + 1) % 5 == 0:
+            writer.flush()
 
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
             scheduler.step(val_acc)
         
         # 保存最佳模型
-        is_best = val_acc > best_acc
-        best_acc = max(val_acc, best_acc)
+        is_best = val_acc > best_state['val_acc']
+        if is_best:
+            best_state.update({
+                'epoch': epoch,
+                'val_acc': val_acc,
+                'val_auc': val_auc,
+                'val_f1': val_f1,
+                'val_recall': val_recall,
+            })
+            best_acc = val_acc
+            # 最佳epoch记录混淆矩阵与 ROC 曲线 (+ 可选 per-class 条形图与 JSON)
+            try:
+                cm_best = confusion_matrix(val_targets, val_preds)
+                fig_cm, ax = plt.subplots(figsize=(4,4))
+                im = ax.imshow(cm_best, cmap='Blues')
+                ax.set_title('Best Val Confusion Matrix')
+                ax.set_xlabel('Pred')
+                ax.set_ylabel('True')
+                for i in range(len(cm_best)):
+                    for j in range(len(cm_best)):
+                        ax.text(j, i, cm_best[i, j], ha='center', va='center', color='black')
+                fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                writer.add_figure('Val/ConfusionMatrix_best', fig_cm, epoch)
+                plt.close(fig_cm)
+                # per-class metrics 可选导出
+                if getattr(getattr(config, 'logging', None), 'export_per_class', True):
+                    try:
+                        per_cls = compute_per_class_metrics(val_targets, val_preds)
+                        # 条形图（指标）
+                        fig_bar = plot_per_class_bars(per_cls, title='Best Val Per-class Metrics')
+                        if fig_bar:
+                            writer.add_figure('Val/PerClassMetrics_best', fig_bar, epoch)
+                            plt.close(fig_bar)
+                        # 支持分布
+                        fig_sup = plot_class_support_bar(per_cls, title='Best Val Class Support')
+                        if fig_sup:
+                            writer.add_figure('Val/ClassSupport_best', fig_sup, epoch)
+                            plt.close(fig_sup)
+                        # 汇总 macro/weighted
+                        summary = compute_macro_weighted_summary(val_targets, val_preds)
+                        try:
+                            import json as _json
+                            per_cls_out = {**per_cls, 'epoch': epoch, 'type': 'best_val', 'summary': summary}
+                            with open(os.path.join(log_dir, 'best_val_per_class_metrics.json'), 'w') as fpc:
+                                _json.dump(per_cls_out, fpc, indent=2)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # ROC 曲线（仅二分类）
+            try:
+                if len(set(val_targets)) == 2:
+                    y_true = np.array(val_targets)
+                    # 取正类概率（假设 index 1）
+                    y_score = np.array([p[1] for p in val_probs])
+                    fpr, tpr, _ = roc_curve(y_true, y_score)
+                    roc_auc = calc_auc(fpr, tpr)
+                    fig_roc, axr = plt.subplots(figsize=(4,4))
+                    axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc:.4f}')
+                    axr.plot([0,1],[0,1],'--', color='gray')
+                    axr.set_xlabel('FPR')
+                    axr.set_ylabel('TPR')
+                    axr.set_title('Best Val ROC')
+                    axr.legend(loc='lower right')
+                    writer.add_figure('Val/ROC_best', fig_roc, epoch)
+                    plt.close(fig_roc)
+            except Exception:
+                pass
+        else:
+            best_acc = max(val_acc, best_acc)
         
         # 保存检查点
         if (epoch + 1) % config.training.save_freq == 0 or is_best:
@@ -447,17 +610,19 @@ def main():
                 'config': config.__dict__
             }, is_best, config.training.checkpoint_dir)
         
-        print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.2f}, Train AUC: {train_auc:.4f}, '
-              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.2f}, Val AUC: {val_auc:.4f}, Best Acc: {best_acc:.2f}%')
-    writer.close()
+    # 进度打印（保持与 train_mosa 同级缩进）
+    print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.2f}, Train AUC: {train_auc:.4f}, '
+          f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, Val Recall: {val_recall:.2f}, Val AUC: {val_auc:.4f}, Best Acc: {best_acc:.2f}%')
+    # 超参数与最终指标写入 (hparams)
+    # 推迟 hparams 与 writer 关闭到测试之后
     # 绘制详细学习曲线
     plot_full_learning_curves(
-        train_batch_losses, train_losses, val_losses, val_accs, config.training.log_dir
+        train_batch_losses, train_losses, val_losses, val_accs, log_dir
     )
     # 绘制学习曲线
-    plot_learning_curves(train_losses, val_losses, train_accs, val_accs, config.training.log_dir)
+    plot_learning_curves(train_losses, val_losses, train_accs, val_accs, log_dir)
     # 绘制指标曲线
-    plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, config.training.log_dir)
+    plot_metrics_curves(train_accs, val_accs, train_f1s, val_f1s, train_recalls, val_recalls, log_dir)
     
     # 训练结束时间
     end_time = datetime.datetime.now()
@@ -477,11 +642,119 @@ def main():
         print("未找到最佳模型，使用最终模型进行评估")
     
     # 在测试集上评估
-    test_acc, auc, cm, report = test_model(model, test_loader, config)
-    
-    print(f"\n最终测试结果:")
-    print(f"测试准确率: {test_acc:.2f}%")
-    print(f"AUC: {auc:.4f}")
+    test_acc, test_auc, cm, _, test_probs, test_precision, test_specificity, test_targets = test_model(model, test_loader, config, save_dir=log_dir)
+    # Test 结果写入 TensorBoard + per-class metrics
+    try:
+        # 混淆矩阵
+        fig_cm, ax = plt.subplots(figsize=(4,4))
+        im = ax.imshow(cm, cmap='Blues')
+        ax.set_title('Test Confusion Matrix')
+        ax.set_xlabel('Pred')
+        ax.set_ylabel('True')
+        for i in range(len(cm)):
+            for j in range(len(cm)):
+                ax.text(j, i, cm[i, j], ha='center', va='center', color='black')
+        fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        writer.add_figure('Test/ConfusionMatrix', fig_cm, 0)
+        plt.close(fig_cm)
+    except Exception:
+        pass
+    # Test ROC (binary only)
+    try:
+        if len(set(test_targets)) == 2:
+            y_true = np.array(test_targets)
+            y_prob = np.array(test_probs)
+            fpr, tpr, _ = roc_curve(y_true, y_prob[:,1])
+            roc_auc = calc_auc(fpr, tpr)
+            fig_roc, axr = plt.subplots(figsize=(4,4))
+            axr.plot(fpr, tpr, label=f'AUC={roc_auc:.4f}')
+            axr.plot([0,1],[0,1],'--', color='gray')
+            axr.set_xlabel('FPR'); axr.set_ylabel('TPR'); axr.set_title('Test ROC')
+            axr.legend(loc='lower right')
+            writer.add_figure('Test/ROC', fig_roc, 0)
+            plt.close(fig_roc)
+        # Scalar test metrics + per-class bars
+        test_f1 = compute_f1(test_targets, np.argmax(np.array(test_probs), axis=1)) if len(test_probs) else float('nan')
+        writer.add_scalar('Test/Accuracy', test_acc, 0)
+        writer.add_scalar('Test/AUC', test_auc if not np.isnan(test_auc) else 0.0, 0)
+        writer.add_scalar('Test/F1', test_f1, 0)
+        writer.add_scalar('Test/Precision', test_precision, 0)
+        writer.add_scalar('Test/Specificity', test_specificity, 0)
+        if getattr(getattr(config, 'logging', None), 'export_per_class', True):
+            try:
+                per_cls_test = compute_per_class_metrics(test_targets, np.argmax(np.array(test_probs), axis=1))
+                fig_bar_test = plot_per_class_bars(per_cls_test, title='Test Per-class Metrics')
+                if fig_bar_test:
+                    writer.add_figure('Test/PerClassMetrics', fig_bar_test, 0)
+                    plt.close(fig_bar_test)
+                fig_sup_test = plot_class_support_bar(per_cls_test, title='Test Class Support')
+                if fig_sup_test:
+                    writer.add_figure('Test/ClassSupport', fig_sup_test, 0)
+                    plt.close(fig_sup_test)
+                summary_test = compute_macro_weighted_summary(test_targets, np.argmax(np.array(test_probs), axis=1))
+                # 写出测试 per-class JSON
+                try:
+                    import json as _json
+                    per_cls_out_t = {**per_cls_test, 'type': 'test', 'summary': summary_test}
+                    with open(os.path.join(log_dir, 'test_per_class_metrics.json'), 'w') as fpt:
+                        _json.dump(per_cls_out_t, fpt, indent=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        hparams = {
+            'lr': config.training.learning_rate,
+            'batch_size': config.data.batch_size,
+            'optimizer': config.training.optimizer,
+            'loss_fn': config.training.loss_fn,
+            'epochs': config.training.num_epochs,
+        }
+        metrics = {
+            'hparam/best_val_acc': best_state.get('val_acc', 0),
+            'hparam/best_val_auc': best_state.get('val_auc', 0),
+            'hparam/best_val_f1': best_state.get('val_f1', 0),
+            'hparam/best_val_recall': best_state.get('val_recall', 0),
+        }
+        writer.add_hparams(hparams, metrics)
+    except Exception:
+        pass
+
+    # 统一输出一个 summary_all.json 汇总关键指标（best validation + test）
+    try:
+        summary_all = {
+            'best_val': {
+                'epoch': best_state.get('epoch', -1),
+                'accuracy': best_state.get('val_acc', 0),
+                'auc': best_state.get('val_auc', 0),
+                'f1_weighted': best_state.get('val_f1', 0),
+                'recall_macro': best_state.get('val_recall', 0)
+            },
+            'test': {
+                'accuracy': test_acc,
+                'auc': test_auc,
+                # test_f1 已在上方局部变量 test_f1 计算，若未定义则重新计算
+                'f1_weighted': (locals().get('test_f1') if 'test_f1' in locals() else compute_f1(test_targets, np.argmax(np.array(test_probs), axis=1), average='weighted')),
+                'precision_weighted': locals().get('test_precision', None),
+                'specificity_macro': locals().get('test_specificity', None)
+            },
+            'config': {
+                'optimizer': config.training.optimizer,
+                'learning_rate': config.training.learning_rate,
+                'batch_size': config.data.batch_size,
+                'epochs': config.training.num_epochs,
+                'loss_fn': config.training.loss_fn,
+                'backbone': config.backbone.model_type,
+                'num_classes': config.backbone.num_classes
+            }
+        }
+        with open(os.path.join(log_dir, 'summary_all.json'), 'w') as sf:
+            json.dump(summary_all, sf, indent=2)
+    except Exception:
+        pass
+    writer.close()
 
 if __name__ == '__main__':
     main()

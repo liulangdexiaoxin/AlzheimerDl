@@ -19,3 +19,6 @@ logs/
 *.pth
 *.tar
 *.png
+# SpecStory explanation file
+/.what-is-this.md
+.specstory

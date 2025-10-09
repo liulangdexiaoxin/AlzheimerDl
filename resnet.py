@@ -33,7 +33,7 @@ class BasicBlock(nn.Module):
         super(BasicBlock, self).__init__()
         self.conv1 = conv3x3(in_channel, out_channel, stride)
         self.bn1 = nn.BatchNorm3d(out_channel)
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=True) # inplace=True 这可以节省内存，但在某些情况下可能会影响梯度计算
         self.conv2 = conv3x3(out_channel, out_channel)
         self.bn2 = nn.BatchNorm3d(out_channel)
         self.downsample = downsample
@@ -75,11 +75,11 @@ class Bottleneck(nn.Module):
             downsample: Optional[nn.Module] = None,
     ) -> None:
         super(Bottleneck, self).__init__()
-        self.conv1 = conv1x1(in_channel, out_channel)
+        self.conv1 = conv1x1(in_channel, out_channel) # 1x1卷积，降维
         self.bn1 = nn.BatchNorm3d(out_channel)
-        self.conv2 = conv3x3(out_channel, out_channel, stride)
+        self.conv2 = conv3x3(out_channel, out_channel, stride) # 3x3卷积，特征提取
         self.bn2 = nn.BatchNorm3d(out_channel)
-        self.conv3 = conv1x1(out_channel, out_channel * self.expansion)
+        self.conv3 = conv1x1(out_channel, out_channel * self.expansion) # 1x1卷积，升维
         self.bn3 = nn.BatchNorm3d(out_channel * self.expansion)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample

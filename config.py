@@ -75,11 +75,17 @@ class TrainingConfig:
     resume: Optional[str] = None  # 恢复训练的检查点路径
 
 @dataclass
+class LoggingConfig:
+    """日志相关扩展配置"""
+    export_per_class: bool = True  # 是否导出 per-class 指标与图像
+
+@dataclass
 class Config:
     data: DataConfig = field(default_factory=DataConfig)
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     mosa: MosaConfig = field(default_factory=MosaConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
     
