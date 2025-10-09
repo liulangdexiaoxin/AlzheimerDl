@@ -17,7 +17,7 @@ import time
 import datetime
 import json
 from tqdm import tqdm
-from sklearn.metrics import recall_score, roc_auc_score, confusion_matrix, classification_report, roc_curve, precision_score
+from sklearn.metrics import recall_score, confusion_matrix, classification_report, roc_curve, precision_score, precision_recall_curve, average_precision_score
 from metrics_utils import (
     compute_auc, compute_precision, compute_specificity, compute_f1,
     compute_recall, compute_confusion_matrix, plot_confusion_matrix_figure,
@@ -25,6 +25,7 @@ from metrics_utils import (
     compute_macro_weighted_summary, plot_class_support_bar
 )
 import matplotlib.pyplot as plt
+import seaborn as sns
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
@@ -159,16 +160,16 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         all_targets.extend(batch_targets)
         all_preds.extend(batch_preds)
         all_probs.extend(probs.detach().cpu().numpy())
-        # TensorBoard记录每batch
+        # TensorBoard记录每batch(仅训练集)，统一命名 Train/Batch/xxx
         if writer is not None:
             f1_batch = compute_f1(batch_targets, batch_preds, average='macro')
             global_step = epoch * len(train_loader) + batch_idx
-            writer.add_scalar('Train/Loss_batch', loss.item(), global_step)
-            writer.add_scalar('Train/Accuracy_batch', acc1.item(), global_step)
-            writer.add_scalar('Train/Recall_batch', recall, global_step)
-            writer.add_scalar('Train/F1_batch', f1_batch, global_step)
+            writer.add_scalar('Train/Batch/Loss', loss.item(), global_step)
+            writer.add_scalar('Train/Batch/Accuracy', acc1.item(), global_step)
+            writer.add_scalar('Train/Batch/Recall', recall, global_step)
+            writer.add_scalar('Train/Batch/F1', f1_batch, global_step)
             if grad_norm is not None:
-                writer.add_scalar('Train/GradNorm_batch', grad_norm, global_step)
+                writer.add_scalar('Train/Batch/GradNorm', grad_norm, global_step)
     # AUC 使用概率
     auc_val = compute_auc(all_targets, all_probs)
     # f1_epoch 计算在主循环中进行，这里不再需要局部变量，保持返回签名兼容
@@ -211,13 +212,7 @@ def validate(model, val_loader, criterion, config, epoch=None, writer=None):
             all_probs.extend(probs.detach().cpu().numpy())
             # F1-score (macro)
             f1 = compute_f1(batch_targets, batch_preds, average='macro')
-            # TensorBoard记录每batch
-            if writer is not None and epoch is not None:
-                global_step = epoch * len(val_loader) + batch_idx
-                writer.add_scalar('Val/Loss_batch', loss.item(), global_step)
-                writer.add_scalar('Val/Accuracy_batch', acc1.item(), global_step)
-                writer.add_scalar('Val/Recall_batch', recall, global_step)
-                writer.add_scalar('Val/F1_batch', f1, global_step)
+            # 按需求删除验证集 batch 级日志
     auc_val = compute_auc(all_targets, all_probs)
     # epoch 级 F1 在主训练循环进行（weighted）；此处无需再计算
     if writer is not None and epoch is not None:
@@ -339,10 +334,8 @@ def test_model(model, test_loader, config, class_names=['CN', 'AD'], save_dir=No
             all_probs.extend(probs.cpu().numpy())
     cm = confusion_matrix(all_targets, all_preds)
     report = classification_report(all_targets, all_preds, target_names=class_names, output_dict=True)
-    if len(class_names) == 2:
-        auc = roc_auc_score(all_targets, [p[1] for p in all_probs])
-    else:
-        auc = roc_auc_score(all_targets, all_probs, multi_class='ovr')
+    # 统一使用 compute_auc
+    auc = compute_auc(all_targets, all_probs)
     test_acc = np.mean(np.array(all_preds) == np.array(all_targets)) * 100
     out_dir = save_dir or config.training.log_dir
     plot_confusion_matrix(cm, class_names, save_path=os.path.join(out_dir, 'confusion_matrix.png'))
@@ -491,6 +484,18 @@ def main():
         if (epoch + 1) % 5 == 0:
             writer.flush()
 
+        # 按配置间隔记录参数/梯度直方图
+        try:
+            lg = getattr(config, 'logging', None)
+            if lg and lg.hist_interval > 0 and ((epoch + 1) % lg.hist_interval == 0):
+                for name, param in model.named_parameters():
+                    if getattr(lg, 'enable_param_hist', True):
+                        writer.add_histogram(f'Params/{name}', param.detach().cpu().numpy(), epoch)
+                    if getattr(lg, 'enable_grad_hist', True) and param.grad is not None:
+                        writer.add_histogram(f'Grads/{name}', param.grad.detach().cpu().numpy(), epoch)
+        except Exception:
+            pass
+
         # batch 级写入已在 train_epoch 内完成，无需重复
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
@@ -504,14 +509,10 @@ def main():
             try:
                 cm_best = confusion_matrix(val_targets, val_preds)
                 fig_cm, ax = plt.subplots(figsize=(4,4))
-                im = ax.imshow(cm_best, cmap='Blues')
+                sns.heatmap(cm_best, annot=True, fmt='d', cmap='Blues', cbar=True, ax=ax)
                 ax.set_title('Best Val Confusion Matrix')
                 ax.set_xlabel('Pred')
                 ax.set_ylabel('True')
-                for i in range(len(cm_best)):
-                    for j in range(len(cm_best)):
-                        ax.text(j, i, cm_best[i, j], ha='center', va='center', color='black')
-                fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 writer.add_figure('Val/ConfusionMatrix_best', fig_cm, epoch)
                 plt.close(fig_cm)
                 if getattr(getattr(config, 'logging', None), 'export_per_class', True):
@@ -544,7 +545,7 @@ def main():
                     y_true = np.array(val_targets)
                     y_prob = np.array(val_probs)
                     fpr, tpr, _ = roc_curve(y_true, y_prob[:,1])
-                    best_roc_auc = roc_auc_score(y_true, y_prob[:,1])
+                    best_roc_auc = compute_auc(y_true, y_prob)
                     fig_roc, axr = plt.subplots(figsize=(4,4))
                     axr.plot(fpr, tpr, label=f'ROC AUC={best_roc_auc:.4f}')
                     axr.plot([0,1],[0,1],'--', color='gray')
@@ -592,22 +593,18 @@ def main():
             y_true = np.array(test_targets)
             y_prob = np.array(test_probs)
             fpr, tpr, _ = roc_curve(y_true, y_prob[:,1])
-            roc_auc = roc_auc_score(y_true, y_prob[:,1])
+            roc_auc_val = compute_auc(y_true, y_prob)
             fig_roc, axr = plt.subplots(figsize=(4,4))
-            axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc:.4f}')
+            axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc_val:.4f}')
             axr.plot([0,1],[0,1],'--', color='gray')
             axr.set_xlabel('FPR'); axr.set_ylabel('TPR'); axr.set_title('Test ROC'); axr.legend(loc='lower right')
             writer.add_figure('Test/ROC', fig_roc, 0)
             plt.close(fig_roc)
         # Confusion matrix figure
         fig_cm, axc = plt.subplots(figsize=(4,4))
-        im = axc.imshow(cm_test, cmap='Blues')
+        sns.heatmap(cm_test, annot=True, fmt='d', cmap='Blues', cbar=True, ax=axc)
         axc.set_title('Test Confusion Matrix')
         axc.set_xlabel('Pred'); axc.set_ylabel('True')
-        for i in range(len(cm_test)):
-            for j in range(len(cm_test)):
-                axc.text(j, i, cm_test[i, j], ha='center', va='center', color='black')
-        fig_cm.colorbar(im, ax=axc, fraction=0.046, pad=0.04)
         writer.add_figure('Test/ConfusionMatrix', fig_cm, 0)
         plt.close(fig_cm)
         # Scalar test metrics + per-class bars
@@ -618,6 +615,21 @@ def main():
         writer.add_scalar('Test/F1', test_f1, 0)
         writer.add_scalar('Test/Precision', test_precision, 0)
         writer.add_scalar('Test/Specificity', test_specificity, 0)
+        # PR 曲线
+        try:
+            if len(set(test_targets)) == 2:
+                y_true = np.array(test_targets)
+                y_prob = np.array(test_probs)[:,1]
+                precision_vals, recall_vals, _ = precision_recall_curve(y_true, y_prob)
+                ap = average_precision_score(y_true, y_prob)
+                fig_pr, axpr = plt.subplots(figsize=(4,4))
+                axpr.plot(recall_vals, precision_vals, label=f'AP={ap:.4f}')
+                axpr.set_xlabel('Recall'); axpr.set_ylabel('Precision'); axpr.set_title('Test PR Curve')
+                axpr.legend(loc='lower left')
+                writer.add_figure('Test/PR', fig_pr, 0)
+                plt.close(fig_pr)
+        except Exception:
+            pass
         if getattr(getattr(config, 'logging', None), 'export_per_class', True):
             try:
                 per_cls_test = compute_per_class_metrics(test_targets, np.argmax(np.array(test_probs), axis=1))

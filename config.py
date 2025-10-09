@@ -78,6 +78,9 @@ class TrainingConfig:
 class LoggingConfig:
     """日志相关扩展配置"""
     export_per_class: bool = True  # 是否导出 per-class 指标与图像
+    enable_param_hist: bool = True  # 是否记录参数直方图
+    enable_grad_hist: bool = True   # 是否记录梯度直方图
+    hist_interval: int = 10         # 每多少个 epoch 记录一次直方图（在 epoch 结束时）
 
 @dataclass
 class Config:

@@ -13,7 +13,7 @@ import os
 import time
 import json
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score, recall_score, roc_curve, auc as calc_auc, precision_score
+from sklearn.metrics import confusion_matrix, classification_report, recall_score, roc_curve, precision_score, precision_recall_curve, average_precision_score
 from metrics_utils import (
     compute_auc, compute_precision, compute_specificity, compute_f1,
     compute_recall, compute_confusion_matrix, plot_confusion_matrix_figure,
@@ -21,6 +21,7 @@ from metrics_utils import (
     compute_macro_weighted_summary, plot_class_support_bar
 )
 from torch.utils.tensorboard import SummaryWriter  # 新增
+import seaborn as sns
 from datetime import datetime
 import matplotlib.pyplot as plt  # 新增
 import datetime  # 新增
@@ -160,16 +161,16 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         all_targets.extend(target.cpu().numpy())
         all_preds.extend(preds.cpu().numpy())
         all_probs.extend(probs.detach().cpu().numpy())
-        # TensorBoard batch logging
+        # TensorBoard 训练 batch 级日志（统一 Train/Batch/ 前缀）
         if writer is not None:
             global_step = epoch * len(train_loader) + batch_idx
-            writer.add_scalar('Train/Loss_batch', loss.item(), global_step)
-            writer.add_scalar('Train/Accuracy_batch', acc1.item(), global_step)
-            writer.add_scalar('Train/Recall_batch', recall, global_step)
             f1_batch = compute_f1(target.cpu().numpy(), preds.cpu().numpy(), average='macro')
-            writer.add_scalar('Train/F1_batch', f1_batch, global_step)
+            writer.add_scalar('Train/Batch/Loss', loss.item(), global_step)
+            writer.add_scalar('Train/Batch/Accuracy', acc1.item(), global_step)
+            writer.add_scalar('Train/Batch/Recall', recall, global_step)
+            writer.add_scalar('Train/Batch/F1', f1_batch, global_step)
             if grad_norm is not None:
-                writer.add_scalar('Train/GradNorm_batch', grad_norm, global_step)
+                writer.add_scalar('Train/Batch/GradNorm', grad_norm, global_step)
         if grad_norm is not None:
             grad_norm_accumulate.append(grad_norm)
         pbar.set_postfix({'Loss': f'{losses.avg:.4f}', 'Acc': f'{top1.avg:.2f}%', 'Recall': f'{recalls.avg:.2f}'})
@@ -215,14 +216,7 @@ def validate(model, val_loader, criterion, config, epoch=None, writer=None):
             all_targets.extend(target.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
-            if writer is not None and epoch is not None:
-                global_step = epoch * len(val_loader) + batch_idx
-                writer.add_scalar('Val/Loss_batch', loss.item(), global_step)
-                writer.add_scalar('Val/Accuracy_batch', acc1.item(), global_step)
-                writer.add_scalar('Val/Recall_batch', recall, global_step)
-                # F1 batch (macro)
-                f1_b = compute_f1(target.cpu().numpy(), preds.cpu().numpy(), average='macro')
-                writer.add_scalar('Val/F1_batch', f1_b, global_step)
+            # 按需求：移除验证集 batch 日志
             pbar.set_postfix({'Loss': f'{losses.avg:.4f}', 'Acc': f'{top1.avg:.2f}%', 'Recall': f'{recalls.avg:.2f}'})
     auc_val = compute_auc(all_targets, all_probs)
     # Precision & Specificity (validation)
@@ -521,6 +515,18 @@ def main():
         if (epoch + 1) % 5 == 0:
             writer.flush()
 
+        # 按配置间隔记录参数/梯度直方图
+        try:
+            lg = getattr(config, 'logging', None)
+            if lg and lg.hist_interval > 0 and ((epoch + 1) % lg.hist_interval == 0):
+                for name, param in model.named_parameters():
+                    if getattr(lg, 'enable_param_hist', True):
+                        writer.add_histogram(f'Params/{name}', param.detach().cpu().numpy(), epoch)
+                    if getattr(lg, 'enable_grad_hist', True) and param.grad is not None:
+                        writer.add_histogram(f'Grads/{name}', param.grad.detach().cpu().numpy(), epoch)
+        except Exception:
+            pass
+
         # 更新学习率（对于plateau调度器）
         if scheduler and config.training.lr_scheduler == "plateau":
             scheduler.step(val_acc)
@@ -540,14 +546,10 @@ def main():
             try:
                 cm_best = confusion_matrix(val_targets, val_preds)
                 fig_cm, ax = plt.subplots(figsize=(4,4))
-                im = ax.imshow(cm_best, cmap='Blues')
+                sns.heatmap(cm_best, annot=True, fmt='d', cmap='Blues', cbar=True, ax=ax)
                 ax.set_title('Best Val Confusion Matrix')
                 ax.set_xlabel('Pred')
                 ax.set_ylabel('True')
-                for i in range(len(cm_best)):
-                    for j in range(len(cm_best)):
-                        ax.text(j, i, cm_best[i, j], ha='center', va='center', color='black')
-                fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
                 writer.add_figure('Val/ConfusionMatrix_best', fig_cm, epoch)
                 plt.close(fig_cm)
                 # per-class metrics 可选导出
@@ -584,9 +586,9 @@ def main():
                     # 取正类概率（假设 index 1）
                     y_score = np.array([p[1] for p in val_probs])
                     fpr, tpr, _ = roc_curve(y_true, y_score)
-                    roc_auc = calc_auc(fpr, tpr)
+                    roc_auc_val = compute_auc(y_true, val_probs)
                     fig_roc, axr = plt.subplots(figsize=(4,4))
-                    axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc:.4f}')
+                    axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc_val:.4f}')
                     axr.plot([0,1],[0,1],'--', color='gray')
                     axr.set_xlabel('FPR')
                     axr.set_ylabel('TPR')
@@ -647,14 +649,10 @@ def main():
     try:
         # 混淆矩阵
         fig_cm, ax = plt.subplots(figsize=(4,4))
-        im = ax.imshow(cm, cmap='Blues')
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True, ax=ax)
         ax.set_title('Test Confusion Matrix')
         ax.set_xlabel('Pred')
         ax.set_ylabel('True')
-        for i in range(len(cm)):
-            for j in range(len(cm)):
-                ax.text(j, i, cm[i, j], ha='center', va='center', color='black')
-        fig_cm.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         writer.add_figure('Test/ConfusionMatrix', fig_cm, 0)
         plt.close(fig_cm)
     except Exception:
@@ -665,9 +663,9 @@ def main():
             y_true = np.array(test_targets)
             y_prob = np.array(test_probs)
             fpr, tpr, _ = roc_curve(y_true, y_prob[:,1])
-            roc_auc = calc_auc(fpr, tpr)
+            roc_auc_val = compute_auc(y_true, y_prob)
             fig_roc, axr = plt.subplots(figsize=(4,4))
-            axr.plot(fpr, tpr, label=f'AUC={roc_auc:.4f}')
+            axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc_val:.4f}')
             axr.plot([0,1],[0,1],'--', color='gray')
             axr.set_xlabel('FPR'); axr.set_ylabel('TPR'); axr.set_title('Test ROC')
             axr.legend(loc='lower right')
@@ -680,6 +678,21 @@ def main():
         writer.add_scalar('Test/F1', test_f1, 0)
         writer.add_scalar('Test/Precision', test_precision, 0)
         writer.add_scalar('Test/Specificity', test_specificity, 0)
+        # PR 曲线
+        try:
+            if len(set(test_targets)) == 2:
+                y_true = np.array(test_targets)
+                y_prob = np.array(test_probs)[:,1]
+                precision_vals, recall_vals, _ = precision_recall_curve(y_true, y_prob)
+                ap = average_precision_score(y_true, y_prob)
+                fig_pr, axpr = plt.subplots(figsize=(4,4))
+                axpr.plot(recall_vals, precision_vals, label=f'AP={ap:.4f}')
+                axpr.set_xlabel('Recall'); axpr.set_ylabel('Precision'); axpr.set_title('Test PR Curve')
+                axpr.legend(loc='lower left')
+                writer.add_figure('Test/PR', fig_pr, 0)
+                plt.close(fig_pr)
+        except Exception:
+            pass
         if getattr(getattr(config, 'logging', None), 'export_per_class', True):
             try:
                 per_cls_test = compute_per_class_metrics(test_targets, np.argmax(np.array(test_probs), axis=1))
@@ -752,6 +765,15 @@ def main():
         }
         with open(os.path.join(log_dir, 'summary_all.json'), 'w') as sf:
             json.dump(summary_all, sf, indent=2)
+    except Exception:
+        pass
+    # 记录参数与梯度直方图
+    try:
+        final_epoch = best_state.get('epoch', 0)
+        for name, param in model.named_parameters():
+            writer.add_histogram(f'Params/{name}', param.detach().cpu().numpy(), final_epoch)
+            if param.grad is not None:
+                writer.add_histogram(f'Grads/{name}', param.grad.detach().cpu().numpy(), final_epoch)
     except Exception:
         pass
     writer.close()
