@@ -27,7 +27,6 @@ from metrics_utils import (
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
 
 # 常量，避免重复字面量
 ACC_LABEL = 'Accuracy (%)'
@@ -421,7 +420,7 @@ def main():
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
     # TensorBoard记录: 独立 run 目录
-    run_name = f"mosa_net_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"mosa_net_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     log_dir = os.path.join(config.training.log_dir, run_name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)

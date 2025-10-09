@@ -22,7 +22,6 @@ from metrics_utils import (
 )
 from torch.utils.tensorboard import SummaryWriter  # 新增
 import seaborn as sns
-from datetime import datetime
 import matplotlib.pyplot as plt  # 新增
 import datetime  # 新增
 
@@ -454,7 +453,7 @@ def main():
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
     # TensorBoard 准备: 为每次运行创建独立子目录
-    run_name = f"pretrain_resnet_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_name = f"pretrain_resnet_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
     log_dir = os.path.join(config.training.log_dir, run_name)
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
