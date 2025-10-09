@@ -446,16 +446,24 @@ def main():
     # 加载检查点（如果存在）
     start_epoch = 0
     best_acc = 0
+    prev_log_dir = None
     if config.training.resume:
+        ckpt_raw = torch.load(config.training.resume, map_location=config.device)
         start_epoch, best_acc = load_checkpoint(
             config.training.resume, model, optimizer, scheduler
         )
+        prev_log_dir = ckpt_raw.get('log_dir', None)
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
-    # TensorBoard 准备: 为每次运行创建独立子目录
-    run_name = f"pretrain_resnet_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    log_dir = os.path.join(config.training.log_dir, run_name)
-    os.makedirs(log_dir, exist_ok=True)
+    # TensorBoard 准备: 复用旧 log_dir（若存在），否则新建
+    if prev_log_dir is not None and os.path.isdir(prev_log_dir):
+        log_dir = prev_log_dir
+        print(f"[Resume] Reusing existing log_dir: {log_dir}")
+    else:
+        run_name = f"pretrain_resnet_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        log_dir = os.path.join(config.training.log_dir, run_name)
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"[New Run] Created log_dir: {log_dir}")
     writer = SummaryWriter(log_dir=log_dir)
     # 记录配置
     try:
@@ -602,13 +610,16 @@ def main():
         
         # 保存检查点
         if (epoch + 1) % config.training.save_freq == 0 or is_best:
+            global_step_ckpt = (epoch + 1) * len(train_loader)
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_acc': best_acc,
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict() if scheduler else None,
-                'config': config.__dict__
+                'config': config.__dict__,
+                'log_dir': log_dir,
+                'global_step': global_step_ckpt
             }, is_best, config.training.checkpoint_dir)
         
     # 进度打印（保持与 train_mosa 同级缩进）

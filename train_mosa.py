@@ -384,7 +384,6 @@ def main():
     start_time = datetime.datetime.now()
     print(f"训练开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 加载配置
     config = Config()
     # 可按需在此处覆写 config.backbone 相关参数
     
@@ -409,21 +408,34 @@ def main():
     optimizer = create_optimizer(model, config)
     criterion = create_loss_fn(config)
     scheduler = create_scheduler(optimizer, config, train_loader)
-    
+
     # 加载检查点（如果存在）
     start_epoch = 0
     best_acc = 0
+    prev_log_dir = None
+    prev_global_step = 0
     if config.training.resume:
+        ckpt_raw = torch.load(config.training.resume, map_location=config.device)
         start_epoch, best_acc = load_checkpoint(
             config.training.resume, model, optimizer, scheduler
         )
-        print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
-    
-    # TensorBoard记录: 独立 run 目录
-    run_name = f"mosa_net_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    log_dir = os.path.join(config.training.log_dir, run_name)
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir)
+        prev_log_dir = ckpt_raw.get('log_dir')
+        prev_global_step = ckpt_raw.get('global_step', 0)
+        print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%, prev_global_step={prev_global_step}")
+
+    # TensorBoard 日志目录：优先复用
+    if prev_log_dir and os.path.isdir(prev_log_dir):
+        log_dir = prev_log_dir
+        print(f"[Resume] Reusing existing log_dir: {log_dir}")
+    else:
+        run_name = f"mosa_net_bs{config.data.batch_size}_lr{config.training.learning_rate}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        log_dir = os.path.join(config.training.log_dir, run_name)
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"[New Run] Created log_dir: {log_dir}")
+
+    # 可选：purge_step 防止重复 step 覆盖（若之前 event 未完整写完可打开）
+    writer = SummaryWriter(log_dir=log_dir)
+
     try:
         writer.add_text('Config', json.dumps(config.__dict__, indent=2))
     except Exception:
@@ -557,13 +569,16 @@ def main():
             except Exception:
                 pass
         if (epoch + 1) % config.training.save_freq == 0 or is_best:
+            global_step_ckpt = (epoch + 1) * len(train_loader)
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
                 'best_acc': best_acc,
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict() if scheduler else None,
-                'config': config.__dict__
+                'config': config.__dict__,
+                'log_dir': log_dir,
+                'global_step': global_step_ckpt
             }, is_best, config.training.checkpoint_dir)
         print(f'Epoch {epoch+1}: '
               f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Train Recall: {train_recall:.4f} | '
