@@ -1,3 +1,7 @@
+import os
+import matplotlib
+os.environ.setdefault('MPLBACKEND', 'Agg')
+matplotlib.use('Agg')
 import torch
 from config import Config
 from data_loader import get_data_loaders

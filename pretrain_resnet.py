@@ -3,7 +3,15 @@
 Notes on F1 logging:
     - Batch-level F1 (Train/F1_batch, Val/F1_batch) uses macro average for stability on small batches.
     - Epoch/Test-level F1 (Train/F1, Val/F1, Test/F1) uses weighted average to reflect class imbalance.
+
+Backend note:
+    为避免 Windows 下默认 TkAgg 在多线程/多进程 DataLoader (num_workers>0) 及 figure 回收时触发
+    "RuntimeError: main thread is not in main loop" 和 "Tcl_AsyncDelete"，这里强制使用无界面后端 Agg。
 """
+import os as _os
+_os.environ.setdefault('MPLBACKEND', 'Agg')  # 优先环境变量
+import matplotlib
+matplotlib.use('Agg')  # 强制非交互后端，避免 Tk 相关崩溃
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -22,7 +30,7 @@ from metrics_utils import (
 )
 from torch.utils.tensorboard import SummaryWriter  # TensorBoard
 import seaborn as sns
-import matplotlib.pyplot as plt  # 新增
+import matplotlib.pyplot as plt  # 已使用 Agg 后端
 import datetime  # 新增
 
 # 常量，统一标签与键

@@ -4,14 +4,11 @@ F1 logging policy:
     - Batch-level F1 (Train/F1_batch, Val/F1_batch): macro average (robust to temporary class absence in small batches).
     - Epoch/Test-level F1 (Train/F1, Val/F1, Test/F1): weighted average (reflects class imbalance in overall performance).
 """
-import matplotlib
-# 设置matplotlib后端 - 对无头环境友好，对TensorBoard兼容
 import os
-if os.environ.get('DISPLAY') is None:
-    matplotlib.use('Agg')  # 无头环境
-else:
-    # 有GUI环境可以使用默认后端，但为了一致性仍使用Agg
-    matplotlib.use('Agg')
+import matplotlib
+# 统一强制使用 Agg，避免 Windows + 多进程下 Tk 异常
+os.environ.setdefault('MPLBACKEND', 'Agg')
+matplotlib.use('Agg')
 
 import torch
 import torch.nn as nn
