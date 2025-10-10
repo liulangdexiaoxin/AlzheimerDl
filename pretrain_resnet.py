@@ -20,7 +20,7 @@ from metrics_utils import (
     plot_roc_figure, compute_per_class_metrics, plot_per_class_bars,
     compute_macro_weighted_summary, plot_class_support_bar
 )
-from torch.utils.tensorboard import SummaryWriter  # 新增
+from torch.utils.tensorboard import SummaryWriter  # TensorBoard
 import seaborn as sns
 import matplotlib.pyplot as plt  # 新增
 import datetime  # 新增
@@ -33,6 +33,46 @@ from config import Config
 from data_loader import get_data_loaders
 from model_builder import build_backbone, count_parameters
 from utils import AverageMeter, accuracy, save_checkpoint, load_checkpoint, FocalLoss, plot_confusion_matrix  # 添加导入
+
+def log_binary_roc_pr(writer, y_true, y_probs, tag_prefix, step, positive_index=1):
+    """记录二分类 ROC 与 PR 曲线及 AUC/AP 标量。
+    参数:
+        writer: SummaryWriter
+        y_true: list/array 标签(0/1)
+        y_probs: 2D array [N, C] softmax 概率
+        tag_prefix: 写入前缀 ('Val/Best' / 'Test' 等)
+        step: epoch 或自定义 step
+        positive_index: 正类索引，默认 1
+    """
+    if writer is None:
+        return
+    try:
+        import numpy as np
+        from sklearn.metrics import roc_curve, precision_recall_curve, average_precision_score
+        arr_true = np.array(y_true)
+        arr_probs = np.array(y_probs)
+        if arr_probs.ndim != 2 or arr_probs.shape[1] <= positive_index:
+            return
+        pos_scores = arr_probs[:, positive_index]
+        fpr, tpr, _ = roc_curve(arr_true, pos_scores)
+        roc_auc_val = compute_auc(arr_true, arr_probs)
+        fig_roc, axr = plt.subplots(figsize=(4,4))
+        axr.plot(fpr, tpr, label=f'AUC={roc_auc_val:.4f}')
+        axr.plot([0,1],[0,1],'--', color='gray')
+        axr.set_xlabel('FPR'); axr.set_ylabel('TPR'); axr.set_title('ROC Curve'); axr.legend(loc='lower right')
+        writer.add_figure(f'{tag_prefix}/ROC', fig_roc, step)
+        plt.close(fig_roc)
+        precision_vals, recall_vals, _ = precision_recall_curve(arr_true, pos_scores)
+        ap = average_precision_score(arr_true, pos_scores)
+        fig_pr, axpr = plt.subplots(figsize=(4,4))
+        axpr.plot(recall_vals, precision_vals, label=f'AP={ap:.4f}')
+        axpr.set_xlabel('Recall'); axpr.set_ylabel('Precision'); axpr.set_title('PR Curve'); axpr.legend(loc='lower left')
+        writer.add_figure(f'{tag_prefix}/PR', fig_pr, step)
+        plt.close(fig_pr)
+        writer.add_scalar(f'{tag_prefix}/ROC_AUC', roc_auc_val, step)
+        writer.add_scalar(f'{tag_prefix}/AP', ap, step)
+    except Exception:
+        pass
 
 def log_epoch_metrics(writer, epoch: int, prefix: str, metrics: dict):
     """统一写入一个阶段的 epoch 级指标
@@ -162,12 +202,15 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         all_probs.extend(probs.detach().cpu().numpy())
         # TensorBoard 训练 batch 级日志（统一 Train/Batch/ 前缀）
         if writer is not None:
-            global_step = epoch * len(train_loader) + batch_idx
+            base_offset = getattr(getattr(config, 'training', None), 'prev_global_step', 0)
+            start_epoch_cfg = getattr(getattr(config, 'training', None), 'start_epoch', 0)
+            rel_epoch = epoch - start_epoch_cfg
+            global_step = base_offset + rel_epoch * len(train_loader) + batch_idx
             f1_batch = compute_f1(target.cpu().numpy(), preds.cpu().numpy(), average='macro')
             writer.add_scalar('Train/Batch/Loss', loss.item(), global_step)
             writer.add_scalar('Train/Batch/Accuracy', acc1.item(), global_step)
             writer.add_scalar('Train/Batch/Recall', recall, global_step)
-            writer.add_scalar('Train/Batch/F1', f1_batch, global_step)
+            writer.add_scalar('Train/Batch/F1_macro', f1_batch, global_step)
             if grad_norm is not None:
                 writer.add_scalar('Train/Batch/GradNorm', grad_norm, global_step)
         if grad_norm is not None:
@@ -447,12 +490,14 @@ def main():
     start_epoch = 0
     best_acc = 0
     prev_log_dir = None
+    prev_global_step = 0
     if config.training.resume:
         ckpt_raw = torch.load(config.training.resume, map_location=config.device)
         start_epoch, best_acc = load_checkpoint(
             config.training.resume, model, optimizer, scheduler
         )
         prev_log_dir = ckpt_raw.get('log_dir', None)
+        prev_global_step = ckpt_raw.get('global_step', 0)
         print(f"Resumed from epoch {start_epoch}, best acc: {best_acc:.2f}%")
     
     # TensorBoard 准备: 复用旧 log_dir（若存在），否则新建
@@ -464,7 +509,10 @@ def main():
         log_dir = os.path.join(config.training.log_dir, run_name)
         os.makedirs(log_dir, exist_ok=True)
         print(f"[New Run] Created log_dir: {log_dir}")
-    writer = SummaryWriter(log_dir=log_dir)
+    if prev_global_step > 0:
+        writer = SummaryWriter(log_dir=log_dir, purge_step=prev_global_step)
+    else:
+        writer = SummaryWriter(log_dir=log_dir)
     # 记录配置
     try:
         writer.add_text('Config', json.dumps(dict(config.__dict__.items()), indent=2))
@@ -504,18 +552,18 @@ def main():
         log_epoch_metrics(writer, epoch, 'Train', {
             'Loss': train_loss,
             'Accuracy': train_acc,
-            'F1': train_f1,
+            'F1_weighted': train_f1,
             'Recall': train_recall,
             'AUC': train_auc,
         })
         log_epoch_metrics(writer, epoch, 'Val', {
             'Loss': val_loss,
             'Accuracy': val_acc,
-            'F1': val_f1,
+            'F1_weighted': val_f1,
             'Recall': val_recall,
             'AUC': val_auc,
         })
-        writer.add_scalar('LearningRate', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('Train/LearningRate', optimizer.param_groups[0]['lr'], epoch)
         # 记录 epoch 平均梯度范数（可选：用最后一次 grad_norm 代表）
         # if 'grad_norm' in locals() and grad_norm is not None:
         #     writer.add_scalar('Train/GradNorm_epoch_last', grad_norm, epoch)
@@ -586,25 +634,10 @@ def main():
                         pass
             except Exception:
                 pass
-            # ROC 曲线（仅二分类）
-            try:
-                if len(set(val_targets)) == 2:
-                    y_true = np.array(val_targets)
-                    # 取正类概率（假设 index 1）
-                    y_score = np.array([p[1] for p in val_probs])
-                    fpr, tpr, _ = roc_curve(y_true, y_score)
-                    roc_auc_val = compute_auc(y_true, val_probs)
-                    fig_roc, axr = plt.subplots(figsize=(4,4))
-                    axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc_val:.4f}')
-                    axr.plot([0,1],[0,1],'--', color='gray')
-                    axr.set_xlabel('FPR')
-                    axr.set_ylabel('TPR')
-                    axr.set_title('Best Val ROC')
-                    axr.legend(loc='lower right')
-                    writer.add_figure('Val/ROC_best', fig_roc, epoch)
-                    plt.close(fig_roc)
-            except Exception:
-                pass
+            # 最佳验证集二分类 ROC/PR
+            if len(set(val_targets)) == 2:
+                pos_idx = getattr(getattr(config, 'training', None), 'positive_index', 1)
+                log_binary_roc_pr(writer, val_targets, val_probs, 'Val/Best', epoch, pos_idx)
         else:
             best_acc = max(val_acc, best_acc)
         
@@ -655,78 +688,52 @@ def main():
     
     # 在测试集上评估
     test_acc, test_auc, cm, _, test_probs, test_precision, test_specificity, test_targets = test_model(model, test_loader, config, save_dir=log_dir)
+    # 独立测试 step，避免与训练 epoch 混淆
+    test_step = config.training.num_epochs
     # Test 结果写入 TensorBoard + per-class metrics
+    test_f1 = compute_f1(test_targets, np.argmax(np.array(test_probs), axis=1), average='weighted') if len(test_probs) else float('nan')
     try:
-        # 混淆矩阵
-        fig_cm, ax = plt.subplots(figsize=(4,4))
+        # Confusion Matrix
+        fig_cm, ax = plt.subplots(figsize=(4, 4))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=True, ax=ax)
         ax.set_title('Test Confusion Matrix')
-        ax.set_xlabel('Pred')
-        ax.set_ylabel('True')
-        writer.add_figure('Test/ConfusionMatrix', fig_cm, 0)
+        ax.set_xlabel('Pred'); ax.set_ylabel('True')
+        writer.add_figure('Test/ConfusionMatrix', fig_cm, test_step)
         plt.close(fig_cm)
     except Exception:
         pass
-    # Test ROC (binary only)
-    try:
-        if len(set(test_targets)) == 2:
-            y_true = np.array(test_targets)
-            y_prob = np.array(test_probs)
-            fpr, tpr, _ = roc_curve(y_true, y_prob[:,1])
-            roc_auc_val = compute_auc(y_true, y_prob)
-            fig_roc, axr = plt.subplots(figsize=(4,4))
-            axr.plot(fpr, tpr, label=f'ROC AUC={roc_auc_val:.4f}')
-            axr.plot([0,1],[0,1],'--', color='gray')
-            axr.set_xlabel('FPR'); axr.set_ylabel('TPR'); axr.set_title('Test ROC')
-            axr.legend(loc='lower right')
-            writer.add_figure('Test/ROC', fig_roc, 0)
-            plt.close(fig_roc)
-        # Scalar test metrics + per-class bars
-        test_f1 = compute_f1(test_targets, np.argmax(np.array(test_probs), axis=1)) if len(test_probs) else float('nan')
-        writer.add_scalar('Test/Accuracy', test_acc, 0)
-        writer.add_scalar('Test/AUC', test_auc if not np.isnan(test_auc) else 0.0, 0)
-        writer.add_scalar('Test/F1', test_f1, 0)
-        writer.add_scalar('Test/Precision', test_precision, 0)
-        writer.add_scalar('Test/Specificity', test_specificity, 0)
-        # PR 曲线
+    # 测试集 ROC/PR
+    if len(set(test_targets)) == 2:
+        pos_idx = getattr(getattr(config, 'training', None), 'positive_index', 1)
+        log_binary_roc_pr(writer, test_targets, test_probs, 'Test', test_step, pos_idx)
+    # Scalars
+    writer.add_scalar('Test/Accuracy', test_acc, test_step)
+    writer.add_scalar('Test/AUC', test_auc if not np.isnan(test_auc) else 0.0, test_step)
+    writer.add_scalar('Test/F1_weighted', test_f1, test_step)
+    writer.add_scalar('Test/Precision', test_precision, test_step)
+    writer.add_scalar('Test/Specificity', test_specificity, test_step)
+    # per-class metrics
+    if getattr(getattr(config, 'logging', None), 'export_per_class', True):
         try:
-            if len(set(test_targets)) == 2:
-                y_true = np.array(test_targets)
-                y_prob = np.array(test_probs)[:,1]
-                precision_vals, recall_vals, _ = precision_recall_curve(y_true, y_prob)
-                ap = average_precision_score(y_true, y_prob)
-                fig_pr, axpr = plt.subplots(figsize=(4,4))
-                axpr.plot(recall_vals, precision_vals, label=f'AP={ap:.4f}')
-                axpr.set_xlabel('Recall'); axpr.set_ylabel('Precision'); axpr.set_title('Test PR Curve')
-                axpr.legend(loc='lower left')
-                writer.add_figure('Test/PR', fig_pr, 0)
-                plt.close(fig_pr)
-        except Exception:
-            pass
-        if getattr(getattr(config, 'logging', None), 'export_per_class', True):
+            per_cls_test = compute_per_class_metrics(test_targets, np.argmax(np.array(test_probs), axis=1))
+            fig_bar_test = plot_per_class_bars(per_cls_test, title='Test Per-class Metrics')
+            if fig_bar_test:
+                writer.add_figure('Test/PerClassMetrics', fig_bar_test, test_step)
+                plt.close(fig_bar_test)
+            fig_sup_test = plot_class_support_bar(per_cls_test, title='Test Class Support')
+            if fig_sup_test:
+                writer.add_figure('Test/ClassSupport', fig_sup_test, test_step)
+                plt.close(fig_sup_test)
+            summary_test = compute_macro_weighted_summary(test_targets, np.argmax(np.array(test_probs), axis=1))
             try:
-                per_cls_test = compute_per_class_metrics(test_targets, np.argmax(np.array(test_probs), axis=1))
-                fig_bar_test = plot_per_class_bars(per_cls_test, title='Test Per-class Metrics')
-                if fig_bar_test:
-                    writer.add_figure('Test/PerClassMetrics', fig_bar_test, 0)
-                    plt.close(fig_bar_test)
-                fig_sup_test = plot_class_support_bar(per_cls_test, title='Test Class Support')
-                if fig_sup_test:
-                    writer.add_figure('Test/ClassSupport', fig_sup_test, 0)
-                    plt.close(fig_sup_test)
-                summary_test = compute_macro_weighted_summary(test_targets, np.argmax(np.array(test_probs), axis=1))
-                # 写出测试 per-class JSON
-                try:
-                    import json as _json
-                    per_cls_out_t = {**per_cls_test, 'type': 'test', 'summary': summary_test}
-                    with open(os.path.join(log_dir, 'test_per_class_metrics.json'), 'w') as fpt:
-                        _json.dump(per_cls_out_t, fpt, indent=2)
-                except Exception:
-                    pass
+                import json as _json
+                per_cls_out_t = {**per_cls_test, 'type': 'test', 'summary': summary_test}
+                with open(os.path.join(log_dir, 'test_per_class_metrics.json'), 'w') as fpt:
+                    _json.dump(per_cls_out_t, fpt, indent=2)
             except Exception:
                 pass
-    except Exception:
-        pass
+        except Exception:
+            pass
     try:
         hparams = {
             'lr': config.training.learning_rate,
@@ -784,6 +791,11 @@ def main():
             writer.add_histogram(f'Params/{name}', param.detach().cpu().numpy(), final_epoch)
             if param.grad is not None:
                 writer.add_histogram(f'Grads/{name}', param.grad.detach().cpu().numpy(), final_epoch)
+    except Exception:
+        pass
+    # 关闭前显式 flush，减少未写入事件风险
+    try:
+        writer.flush()
     except Exception:
         pass
     writer.close()

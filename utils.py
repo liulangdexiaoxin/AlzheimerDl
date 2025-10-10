@@ -115,4 +115,4 @@ def plot_confusion_matrix(cm, class_names, save_path=None):
     
     if save_path:
         plt.savefig(save_path, bbox_inches='tight')
-    plt.show()
+    plt.close()  # 释放内存，替换plt.show()
