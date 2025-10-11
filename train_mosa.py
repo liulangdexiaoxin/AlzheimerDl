@@ -39,6 +39,112 @@ from config import Config
 from data_loader import get_data_loaders
 from model_builder import build_mosa_net, count_parameters
 from utils import AverageMeter, accuracy, save_checkpoint, load_checkpoint, FocalLoss, plot_confusion_matrix
+import math
+
+class EntropyAdaptiveLR:
+    """根据预测分布熵动态调整学习率的包装器 (增强版)。
+    支持多种缩放模式:
+        linear : scale = 1 + factor * diff
+        tanh   : scale = 1 + factor * tanh(diff)
+        sigmoid: scale = 1 + factor * (sigmoid(diff) - 0.5) * 2
+        inverse: scale = 1 / (1 + factor * diff)  (diff>0 降低 lr)
+        pid    : 使用 diff 的 P/I/D 分量构建 scale
+    其它特性:
+        - EMA 平滑 + 滑动窗口平均
+        - warmup: 前 entropy_warmup_steps 仅统计不调整
+        - 可选择以当前 scheduler lr 作为基准缩放
+        - PID 模式下维护积分与前一误差
+    """
+    def __init__(self, optimizer, num_classes, cfg):
+        self.opt = optimizer
+        self.num_classes = num_classes
+        self.window = cfg.entropy_window
+        self.min_scale = cfg.entropy_min_lr_scale
+        self.max_scale = cfg.entropy_max_lr_scale
+        self.target = cfg.entropy_target
+        self.smooth = cfg.entropy_smooth
+        self.interval = cfg.entropy_adjust_interval
+        self.clamp = cfg.entropy_clamp
+        self.mode = getattr(cfg, 'entropy_mode', 'linear')
+        self.factor = getattr(cfg, 'entropy_scale_factor', 1.0)
+        self.warmup_steps = getattr(cfg, 'entropy_warmup_steps', 0)
+        self.use_dynamic_base = getattr(cfg, 'entropy_use_scheduler_lr_as_base', True)
+        # PID 参数
+        self.kp = getattr(cfg, 'entropy_pid_kp', 0.8)
+        self.ki = getattr(cfg, 'entropy_pid_ki', 0.05)
+        self.kd = getattr(cfg, 'entropy_pid_kd', 0.2)
+        self.integral = 0.0
+        self.prev_error = None
+        self.buffer = []
+        self.ema_entropy = None
+        self.base_lrs = [g['lr'] for g in self.opt.param_groups]
+        self.steps_seen = 0
+
+    def _compute_scale(self, diff):
+        # diff = avg_entropy - target (希望 diff ~ 0)
+        if self.mode == 'linear':
+            scale = 1.0 + self.factor * diff
+        elif self.mode == 'tanh':
+            scale = 1.0 + self.factor * math.tanh(diff)
+        elif self.mode == 'sigmoid':
+            scale = 1.0 + self.factor * (1/(1+math.exp(-diff)) - 0.5) * 2
+        elif self.mode == 'inverse':
+            scale = 1.0 / (1.0 + self.factor * diff)
+        elif self.mode == 'pid':
+            error = -diff  # 期望 avg_entropy 接近 target，error = target - avg => -diff
+            self.integral += error
+            derivative = 0.0 if self.prev_error is None else (error - self.prev_error)
+            self.prev_error = error
+            pid_out = self.kp * error + self.ki * self.integral + self.kd * derivative
+            scale = 1.0 + self.factor * pid_out
+        else:
+            scale = 1.0 + self.factor * diff
+        if self.clamp:
+            scale = max(self.min_scale, min(self.max_scale, scale))
+        return scale
+
+    def step_entropy(self, probs_batch):
+        with torch.no_grad():
+            self.steps_seen += 1
+            p = probs_batch.clamp(min=1e-8, max=1.0)
+            ent = (-p * p.log()).sum(dim=1).mean().item()
+            max_ent = math.log(self.num_classes + 1e-9)
+            norm_ent = ent / max_ent
+            if self.ema_entropy is None:
+                self.ema_entropy = norm_ent
+            else:
+                self.ema_entropy = self.smooth * norm_ent + (1 - self.smooth) * self.ema_entropy
+            self.buffer.append(self.ema_entropy)
+            if len(self.buffer) > self.window:
+                self.buffer.pop(0)
+            if self.steps_seen < self.warmup_steps:
+                return self.current_lr_state(update=False, avg_entropy=None, scale=None, reason='warmup')
+            if self.steps_seen % self.interval != 0:
+                return self.current_lr_state(update=False, avg_entropy=None, scale=None, reason='interval_skip')
+            avg_entropy = sum(self.buffer) / len(self.buffer)
+            diff = avg_entropy - self.target
+            scale = self._compute_scale(diff)
+            # 基准 lr
+            if self.use_dynamic_base:
+                base_current = [g['lr'] for g in self.opt.param_groups]
+            else:
+                base_current = self.base_lrs
+            for i, g in enumerate(self.opt.param_groups):
+                g['lr'] = base_current[i] * scale
+            return self.current_lr_state(update=True, avg_entropy=avg_entropy, scale=scale, reason='applied')
+
+    def current_lr_state(self, update=False, avg_entropy=None, scale=None, reason=None):
+        return {
+            'ema_entropy': self.ema_entropy,
+            'buffer_len': len(self.buffer),
+            'last_lrs': [g['lr'] for g in self.opt.param_groups],
+            'updated': update,
+            'avg_entropy': avg_entropy,
+            'scale': scale,
+            'steps_seen': self.steps_seen,
+            'reason': reason,
+            'mode': self.mode
+        }
 
 def log_binary_roc_pr(writer, y_true, y_probs, tag_prefix, step, positive_index=1):
     """记录二分类 ROC 与 PR 曲线以及 AUC/AP 标量。
@@ -62,7 +168,7 @@ def log_binary_roc_pr(writer, y_true, y_probs, tag_prefix, step, positive_index=
         if arr_probs.ndim != 2 or arr_probs.shape[1] <= positive_index:
             return
         if len(arr_true) == 0 or np.any(np.isnan(arr_true)) or np.any(np.isnan(arr_probs)):
-            print(f"Warning: Invalid data for ROC/PR curves - contains NaN or empty")
+            print("Warning: Invalid data for ROC/PR curves - contains NaN or empty")
             return
             
         pos_scores = arr_probs[:, positive_index]
@@ -172,6 +278,13 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
     grad_norm_accumulate = []
     batch_losses = []
 
+    # 初始化熵自适应调度器
+    entropy_adaptor = None
+    if getattr(config.training, 'entropy_adaptive', False):
+        entropy_adaptor = EntropyAdaptiveLR(optimizer, config.backbone.num_classes, config.training)
+        if writer is not None:
+            writer.add_text('AdaptiveLR/Enabled', f'Entropy adaptive LR active (target={config.training.entropy_target}, mode={config.training.entropy_mode})', epoch)
+
     pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{config.training.num_epochs} [Train]')
     for batch_idx, (data, target, _) in enumerate(pbar):
         data, target = data.to(config.device), target.to(config.device)
@@ -194,12 +307,28 @@ def train_epoch(model, train_loader, optimizer, criterion, scheduler, epoch, con
         else:
             grad_norm = None
         optimizer.step()
+        probs = torch.softmax(output, dim=1)  # 需在调整前得到概率
+        # 熵自适应 LR 调整 (放在 scheduler 之前, 以便 scheduler 基于已调 lr 继续退火)
+        if entropy_adaptor is not None:
+            try:
+                state_lr = entropy_adaptor.step_entropy(probs.detach())
+                if writer is not None:
+                    if state_lr.get('updated'):
+                        writer.add_scalar('AdaptiveLR/Scale', state_lr.get('scale', 1.0), state_lr.get('steps_seen', 0))
+                        writer.add_scalar('AdaptiveLR/AvgEntropy', state_lr.get('avg_entropy', 0.0), state_lr.get('steps_seen', 0))
+                        writer.add_scalar('AdaptiveLR/EMAEntropy', state_lr.get('ema_entropy', 0.0), state_lr.get('steps_seen', 0))
+                        writer.add_scalar('AdaptiveLR/LR', optimizer.param_groups[0]['lr'], state_lr.get('steps_seen', 0))
+                    else:
+                        # 也记录 EMA 以供分析
+                        writer.add_scalar('AdaptiveLR/EMAEntropy', state_lr.get('ema_entropy', 0.0), state_lr.get('steps_seen', 0))
+            except Exception as e:
+                if writer is not None:
+                    writer.add_text('AdaptiveLR/Error', str(e), epoch)
         if scheduler and config.training.lr_scheduler == "cosine":
             scheduler.step()
         acc1 = accuracy(output, target, topk=(1,))[0]
         losses.update(loss.item(), data.size(0))
         top1.update(acc1.item(), data.size(0))
-        probs = torch.softmax(output, dim=1)
         preds = torch.argmax(probs, dim=1)
         batch_targets = target.cpu().numpy()
         batch_preds = preds.cpu().numpy()
@@ -261,8 +390,7 @@ def validate(model, val_loader, criterion, config, epoch=None, writer=None):
             all_targets.extend(batch_targets)
             all_preds.extend(batch_preds)
             all_probs.extend(probs.detach().cpu().numpy())
-            # F1-score (macro)
-            f1 = compute_f1(batch_targets, batch_preds, average='macro')
+            # F1-score (macro) 计算已在批次外使用 weighted 版本，不保存临时变量
             # 按需求删除验证集 batch 级日志
     auc_val = compute_auc(all_targets, all_probs)
     # epoch 级 F1 在主训练循环进行（weighted）；此处无需再计算

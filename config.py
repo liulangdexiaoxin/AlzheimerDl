@@ -52,7 +52,7 @@ class TrainingConfig:
     
     # 学习率调度
     lr_scheduler: str = "cosine"  # "cosine", "step", "plateau"
-    step_size: int = 10  # 用于step scheduler
+    step_size: int = 10  # 用于step scheduler，每多少epoch调整一次学习率
     gamma: float = 0.1  # 用于step scheduler
     min_lr: float = 1e-7  # 用于cosine/plateau scheduler
     patience: int = 5  # 用于plateau scheduler
@@ -73,6 +73,24 @@ class TrainingConfig:
     log_dir: str = "./logs"
     save_freq: int = 10  # 每多少epoch保存一次
     resume: Optional[str] = None  # 恢复训练的检查点路径
+    # 熵自适应学习率相关参数
+    entropy_adaptive: bool = False          # 是否启用熵驱动学习率调整
+    entropy_window: int = 50               # 计算滑动窗口平均熵的步数
+    entropy_min_lr_scale: float = 0.3       # 当熵极低(模型非常确定)时的最小 lr 缩放比例
+    entropy_max_lr_scale: float = 1.5       # 当熵较高(模型不确定)时的最大 lr 缩放比例
+    entropy_target: float = 0.5             # 目标平均熵 (基于 log(num_classes) 归一化后 0~1)
+    entropy_smooth: float = 0.1             # EMA 平滑系数 (0-1)
+    entropy_adjust_interval: int = 10       # 每多少个 batch 进行一次学习率调整
+    entropy_clamp: bool = True              # 是否对动态缩放进行区间裁剪
+    # 新增高级控制参数
+    entropy_mode: str = "linear"            # 调整模式: linear|tanh|sigmoid|inverse|pid
+    entropy_scale_factor: float = 1.0       # 对 diff 的整体缩放放大/缩小调整幅度
+    entropy_warmup_steps: int = 0           # 前若干 step 不做自适应，仅收集统计
+    entropy_use_scheduler_lr_as_base: bool = True  # 是否每次以调度器当前 lr 为基准再缩放
+    # PID 模式参数
+    entropy_pid_kp: float = 0.8
+    entropy_pid_ki: float = 0.05
+    entropy_pid_kd: float = 0.2
 
 @dataclass
 class LoggingConfig:
